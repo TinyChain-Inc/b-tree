@@ -2,12 +2,11 @@ use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::{fmt, io};
 
-use async_trait::async_trait;
 use collate::Collator;
 use destream::{de, en};
 use freqfs::Cache;
 use futures::{TryFutureExt, TryStreamExt};
-use rand::Rng;
+use rand::RngExt;
 use safecast::as_type;
 use smallvec::smallvec;
 use tokio::fs;
@@ -16,11 +15,11 @@ use b_tree::{BTreeLock, Node, Range, Schema};
 
 const BLOCK_SIZE: usize = 4_096;
 
+#[derive(Clone)]
 enum File {
     Node(Node<Vec<Vec<i16>>>),
 }
 
-#[async_trait]
 impl de::FromStream for File {
     type Context = ();
 
@@ -91,9 +90,9 @@ impl<T: fmt::Debug> Schema for ExampleSchema<T> {
 }
 
 async fn setup_tmp_dir() -> Result<PathBuf, io::Error> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     loop {
-        let rand: u32 = rng.gen();
+        let rand: u32 = rng.random();
         let path = PathBuf::from(format!("/tmp/test_btree_{}", rand));
         if !path.exists() {
             fs::create_dir(&path).await?;
@@ -271,7 +270,7 @@ async fn functional_test() -> Result<(), io::Error> {
             let lo = view.first(Range::<i16>::default()).await?.expect("first")[0];
             let hi = view.last(Range::<i16>::default()).await?.expect("last")[0];
 
-            let i = rand::thread_rng().gen_range(lo..(hi + 1));
+            let i = rand::rng().random_range(lo..(hi + 1));
             let key = [i, i16::MAX - i, i16::MAX - 2 * i];
 
             let present = view.contains(&key).await?;
@@ -326,23 +325,23 @@ async fn load_test() -> Result<(), io::Error> {
         assert_eq!(view.count(&Range::<i16>::default()).await?, 0);
 
         for _ in 0..(n / 2) {
-            let i: i16 = rand::thread_rng().gen_range(i16::MIN..i16::MAX);
+            let i: i16 = rand::rng().random_range(i16::MIN..i16::MAX);
             let key = vec![i, i / 2, i % 2];
             view.insert(key).await?;
         }
 
         for _ in (n / 2)..n {
-            let i: i16 = rand::thread_rng().gen_range(i16::MIN..i16::MAX);
+            let i: i16 = rand::rng().random_range(i16::MIN..i16::MAX);
             let key = vec![i, i / 2, i % 2];
             view.insert(key).await?;
 
-            let i: i16 = rand::thread_rng().gen_range(i16::MIN..i16::MAX);
+            let i: i16 = rand::rng().random_range(i16::MIN..i16::MAX);
             let key = [i, i / 2, i % 2];
             view.delete(&key).await?;
         }
 
         for _ in 0..(n / 2) {
-            let i: i16 = rand::thread_rng().gen_range(i16::MIN..i16::MAX);
+            let i: i16 = rand::rng().random_range(i16::MIN..i16::MAX);
             let key = [i, i / 2, i % 2];
             view.delete(&key).await?;
         }

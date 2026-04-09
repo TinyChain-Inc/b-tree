@@ -3,12 +3,20 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::{fmt, io};
 
-#[cfg(feature = "stream")]
-use async_trait::async_trait;
 use collate::{Collate, OverlapsValue};
 #[cfg(feature = "stream")]
 use destream::de;
-use freqfs::*;
+use freqfs::{
+    DirReadGuardOwned, 
+    DirWriteGuardOwned,
+    FileReadGuardOwned,
+    FileWriteGuardOwned,
+    DirLock,
+    FileLoad,
+    FileSave,
+    DirDeref,
+    FileReadGuard,
+};
 use futures::future::{self, Future, FutureExt};
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use futures::try_join;
@@ -141,7 +149,7 @@ where
     /// Write any modified blocks of thie [`BTree`] to the filesystem.
     pub async fn sync(&self) -> Result<(), io::Error>
     where
-        FE: for<'a> freqfs::FileSave<'a>,
+        FE: FileSave + Clone,
     {
         self.dir.sync().await
     }
@@ -239,7 +247,6 @@ struct BTreeVisitor<S, C, FE> {
 }
 
 #[cfg(feature = "stream")]
-#[async_trait]
 impl<S, C, FE> de::Visitor for BTreeVisitor<S, C, FE>
 where
     S: Schema + Send + Sync,
@@ -266,7 +273,6 @@ where
 }
 
 #[cfg(feature = "stream")]
-#[async_trait]
 impl<S, C, FE> de::FromStream for BTreeLock<S, C, FE>
 where
     S: Schema + Send + Sync,

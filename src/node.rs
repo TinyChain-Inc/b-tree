@@ -2,8 +2,6 @@ use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::fmt;
 
-#[cfg(feature = "stream")]
-use async_trait::async_trait;
 use collate::{Collate, Overlap, OverlapsValue};
 #[cfg(feature = "stream")]
 use destream::{de, en};
@@ -175,7 +173,6 @@ impl<C, N> NodeVisitor<C, N> {
 }
 
 #[cfg(feature = "stream")]
-#[async_trait]
 impl<N> de::Visitor for NodeVisitor<N::Context, N>
 where
     N: de::FromStream,
@@ -203,7 +200,6 @@ where
 }
 
 #[cfg(feature = "stream")]
-#[async_trait]
 impl<N> de::FromStream for Node<N>
 where
     N: de::FromStream,
