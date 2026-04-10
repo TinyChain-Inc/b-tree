@@ -27,12 +27,12 @@ freqfs = "0.12"
 futures = "0.3"
 get-size = "0.1"
 log = { version = "0.4", features = ["release_max_level_info"], optional = true }
-num_cpus = "1.16"
-pin-project = "1.0"
+num_cpus = "1.17"
+pin-project = "1.1"
 safecast = "0.2"
-smallvec = "1.13"
-uuid = "1.10"
+smallvec = "1.15"
+uuid = "1.23"
 
 [dev-dependencies]
 rand = "0.10"
-tokio = { version = "1.39", features = ["macros"] }
+tokio = { version = "1.51", features = ["macros"] }
