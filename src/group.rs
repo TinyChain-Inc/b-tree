@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use futures::stream::{Fuse, Stream, StreamExt};
 use pin_project::pin_project;

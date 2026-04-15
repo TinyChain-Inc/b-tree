@@ -107,6 +107,9 @@ pub trait Schema: Eq + fmt::Debug {
     /// Get the number of columns in this [`Schema`].
     fn len(&self) -> usize;
 
+    /// Return true if this [`Schema`] is empty
+    fn is_empty(&self) -> bool;
+
     /// Get the order of the nodes in a B+Tree with this [`Schema`].
     fn order(&self) -> usize;
 

@@ -1,18 +1,20 @@
 use std::borrow::Borrow;
+use std::mem;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{fmt, io};
 
-#[cfg(feature = "stream")]
-use async_trait::async_trait;
 use collate::{Collate, OverlapsValue};
 #[cfg(feature = "stream")]
 use destream::de;
-use freqfs::*;
+use freqfs::{
+    DirDeref, DirLock, DirReadGuardOwned, DirWriteGuardOwned, FileLoad, FileReadGuard,
+    FileReadGuardOwned, FileSave, FileWriteGuardOwned,
+};
+use futures::TryFutureExt;
 use futures::future::{self, Future, FutureExt};
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use futures::try_join;
-use futures::TryFutureExt;
 use safecast::AsType;
 use smallvec::SmallVec;
 use uuid::Uuid;
@@ -20,7 +22,7 @@ use uuid::Uuid;
 use super::group::GroupBy;
 use super::node::Block;
 use super::range::Range;
-use super::{Collator, Key, Schema, NODE_STACK_SIZE};
+use super::{Collator, Key, NODE_STACK_SIZE, Schema};
 
 type NodeStack<V> = SmallVec<[Key<V>; NODE_STACK_SIZE]>;
 
@@ -36,6 +38,16 @@ pub type Keys<V> = Pin<Box<dyn Stream<Item = Result<Key<V>, io::Error>> + Send>>
 type Nodes<FE, V> = Pin<Box<dyn Stream<Item = Result<Leaf<FE, V>, io::Error>> + Send>>;
 
 type Node<V> = super::node::Node<Vec<Vec<V>>>;
+
+type ResultNodes<FE, V> = Result<Nodes<FE, V>, io::Error>;
+
+type ResultDelete<FE, V> = Result<Delete<FE, V>, io::Error>;
+
+type ResultMergeIndex<V> = Result<MergeIndexLeft<V>, io::Error>;
+
+type ResultMergeLeaf<V> = Result<MergeLeafLeft<V>, io::Error>;
+
+type ResultInsert<V> = Result<Insert<V>, io::Error>;
 
 const ROOT: Uuid = Uuid::from_fields(0, 0, 0, &[0u8; 8]);
 
@@ -141,7 +153,7 @@ where
     /// Write any modified blocks of thie [`BTree`] to the filesystem.
     pub async fn sync(&self) -> Result<(), io::Error>
     where
-        FE: for<'a> freqfs::FileSave<'a>,
+        FE: FileSave + Clone,
     {
         self.dir.sync().await
     }
@@ -239,7 +251,6 @@ struct BTreeVisitor<S, C, FE> {
 }
 
 #[cfg(feature = "stream")]
-#[async_trait]
 impl<S, C, FE> de::Visitor for BTreeVisitor<S, C, FE>
 where
     S: Schema + Send + Sync,
@@ -266,7 +277,6 @@ where
 }
 
 #[cfg(feature = "stream")]
-#[async_trait]
 impl<S, C, FE> de::FromStream for BTreeLock<S, C, FE>
 where
     S: Schema + Send + Sync,
@@ -339,7 +349,7 @@ where
         loop {
             match &*node {
                 Node::Leaf(keys) => {
-                    let i = keys.bisect_left(&key, &self.collator);
+                    let i = keys.bisect_left(key, &self.collator);
 
                     break Ok(if i < keys.len() {
                         match keys.get(i) {
@@ -386,9 +396,9 @@ where
     {
         Box::pin(async move {
             match &*node {
-                Node::Leaf(keys) if range.is_default() => Ok(keys.len() as u64),
+                Node::Leaf(keys) if range.is_empty() => Ok(keys.len() as u64),
                 Node::Leaf(keys) => {
-                    let (l, r) = keys.bisect(&range, &self.collator);
+                    let (l, r) = keys.bisect(range, &self.collator);
 
                     if l == keys.len() {
                         Ok(0)
@@ -402,7 +412,7 @@ where
                         Ok((r - l) as u64)
                     }
                 }
-                Node::Index(_bounds, children) if range.is_default() => {
+                Node::Index(_bounds, children) if range.is_empty() => {
                     stream::iter(children)
                         .then(|node_id| self.dir.as_dir().read_file(node_id))
                         .map_ok(|node| self.count_inner(range, node))
@@ -411,7 +421,7 @@ where
                         .await
                 }
                 Node::Index(bounds, children) => {
-                    let (l, r) = bounds.bisect(&range, &self.collator);
+                    let (l, r) = bounds.bisect(range, &self.collator);
                     let l = if l == 0 { l } else { l - 1 };
 
                     if l == children.len() {
@@ -467,10 +477,10 @@ where
 
         let mut node = self.dir.as_dir().read_file(&ROOT).await?;
 
-        if let Node::Leaf(keys) = &*node {
-            if keys.is_empty() {
-                return Ok(None);
-            }
+        if let Node::Leaf(keys) = &*node
+            && keys.is_empty()
+        {
+            return Ok(None);
         }
 
         Ok(loop {
@@ -517,10 +527,10 @@ where
 
         let mut node = self.dir.as_dir().read_file(&ROOT).await?;
 
-        if let Node::Leaf(keys) = &*node {
-            if keys.is_empty() {
-                return Ok(None);
-            }
+        if let Node::Leaf(keys) = &*node
+            && keys.is_empty()
+        {
+            return Ok(None);
         }
 
         Ok(loop {
@@ -593,7 +603,7 @@ where
         Box::pin(async move {
             let order = self.schema.order();
 
-            match &*node {
+            match node {
                 Node::Leaf(keys) => {
                     assert!(keys.len() >= (order / 2) - 1);
                     assert!(keys.len() < order);
@@ -630,11 +640,7 @@ where
     Node<S::Value>: FileLoad + fmt::Debug,
 {
     /// Construct a [`Stream`] of all the keys in the given `range` of this B+Tree.
-    pub async fn keys<BV>(
-        self,
-        range: Range<BV>,
-        reverse: bool,
-    ) -> Result<Keys<S::Value>, io::Error>
+    pub async fn keys<BV>(self, range: Range<BV>) -> Result<Keys<S::Value>, io::Error>
     where
         BV: Borrow<S::Value> + Clone + Send + Sync + 'static,
     {
@@ -643,41 +649,49 @@ where
             "B+Tree is missing its root node"
         );
 
-        if reverse {
-            let nodes = nodes_reverse(self.dir, self.collator, range, ROOT).await?;
+        let nodes = nodes_forward(self.dir, self.collator, range, ROOT).await?;
 
-            let keys = nodes
-                .map_ok(|leaf| async move {
-                    let mut keys = NodeStack::with_capacity(leaf.as_ref().len());
+        let keys = nodes
+            .map_ok(move |leaf| async move {
+                let mut keys = NodeStack::with_capacity(leaf.as_ref().len());
 
-                    for key in leaf.as_ref().into_iter().rev() {
-                        keys.push(key.into_iter().cloned().collect());
-                    }
+                for key in leaf.as_ref() {
+                    keys.push(key.iter().cloned().collect())
+                }
 
-                    Ok(stream::iter(keys).map(Ok))
-                })
-                .try_buffered(num_cpus::get())
-                .try_flatten();
+                Ok(stream::iter(keys).map(Ok))
+            })
+            .try_buffered(num_cpus::get())
+            .try_flatten();
 
-            Ok(Box::pin(keys))
-        } else {
-            let nodes = nodes_forward(self.dir, self.collator, range, ROOT).await?;
+        Ok(Box::pin(keys))
+    }
 
-            let keys = nodes
-                .map_ok(|leaf| async move {
-                    let mut keys = NodeStack::with_capacity(leaf.as_ref().len());
+    pub async fn keys_rev<BV>(self, range: Range<BV>) -> Result<Keys<S::Value>, io::Error>
+    where
+        BV: Borrow<S::Value> + Clone + Send + Sync + 'static,
+    {
+        debug_assert!(
+            self.dir.as_dir().contains(&ROOT),
+            "B+Tree is missing its root node"
+        );
 
-                    for key in leaf.as_ref() {
-                        keys.push(key.into_iter().cloned().collect());
-                    }
+        let nodes = nodes_reverse(self.dir, self.collator, range, ROOT).await?;
 
-                    Ok(stream::iter(keys).map(Ok))
-                })
-                .try_buffered(num_cpus::get())
-                .try_flatten();
+        let keys = nodes
+            .map_ok(|leaf| async move {
+                let mut keys = NodeStack::with_capacity(leaf.as_ref().len());
 
-            Ok(Box::pin(keys))
-        }
+                for key in leaf.as_ref().iter().rev() {
+                    keys.push(key.iter().cloned().collect());
+                }
+
+                Ok(stream::iter(keys).map(Ok))
+            })
+            .try_buffered(num_cpus::get())
+            .try_flatten();
+
+        Ok(Box::pin(keys))
     }
 
     /// Construct a [`Stream`] of unique length-`n` prefixes within the given `range`.
@@ -751,7 +765,7 @@ where
         let default_range = Range::<S::Value>::default();
         let count = self.count(&default_range).await? as usize;
         let mut contents = Vec::with_capacity(count);
-        let mut stream = self.keys(default_range, false).await?;
+        let mut stream = self.keys(default_range).await?;
         while let Some(key) = stream.try_next().await? {
             contents.push(key);
         }
@@ -765,7 +779,7 @@ where
 enum NodeRead {
     Excluded,
     Child(Uuid),
-    Children(SmallVec<[Uuid; NODE_STACK_SIZE]>),
+    Children(Box<SmallVec<[Uuid; NODE_STACK_SIZE]>>),
     Leaf((usize, usize)),
 }
 
@@ -774,7 +788,7 @@ impl fmt::Debug for NodeRead {
         match self {
             Self::Excluded => f.write_str("(none)"),
             Self::Child(id) => write!(f, "child {id}"),
-            Self::Children(ids) => write!(f, "children {ids:?}"),
+            Self::Children(ids) => write!(f, "children {:?}", *ids),
             Self::Leaf((start, end)) => write!(f, "leaf records [{start}..{end})"),
         }
     }
@@ -785,7 +799,7 @@ fn nodes_forward<C, V, BV, FE, G>(
     collator: Collator<C>,
     range: Range<BV>,
     node_id: Uuid,
-) -> Pin<Box<dyn Future<Output = Result<Nodes<FE, V>, io::Error>> + Send>>
+) -> Pin<Box<dyn Future<Output = ResultNodes<FE, V>> + Send>>
 where
     C: Collate<Value = V> + Clone + Send + Sync + 'static,
     V: Clone + PartialEq + fmt::Debug + Send + Sync + 'static,
@@ -800,7 +814,7 @@ where
     let file = dir.as_dir().get_file(&node_id).expect("node").clone();
     let fut = file.into_read().map_ok(move |node| {
         let read = match &*node {
-            Node::Leaf(keys) if range.is_default() => NodeRead::Leaf((0, keys.len())),
+            Node::Leaf(keys) if range.is_empty() => NodeRead::Leaf((0, keys.len())),
             Node::Leaf(keys) => {
                 let (l, r) = keys.bisect(&range, &collator);
 
@@ -816,13 +830,13 @@ where
                     NodeRead::Leaf((l, r))
                 }
             }
-            Node::Index(_bounds, children) if range.is_default() => {
+            Node::Index(_bounds, children) if range.is_empty() => {
                 debug_assert!(!children.is_empty());
 
                 if children.len() == 1 {
                     NodeRead::Child(children[0])
                 } else {
-                    NodeRead::Children(SmallVec::from_slice(&children))
+                    NodeRead::Children(Box::new(SmallVec::from_slice(children)))
                 }
             }
             Node::Index(bounds, children) => {
@@ -836,7 +850,7 @@ where
                 } else if l == r || l + 1 == r {
                     NodeRead::Child(children[l])
                 } else {
-                    NodeRead::Children(SmallVec::from_slice(&children[l..r]))
+                    NodeRead::Children(Box::new(SmallVec::from_slice(&children[l..r])))
                 }
             }
         };
@@ -892,7 +906,7 @@ fn nodes_reverse<C, V, BV, FE, G>(
     collator: Collator<C>,
     range: Range<BV>,
     node_id: Uuid,
-) -> Pin<Box<dyn Future<Output = Result<Nodes<FE, V>, io::Error>> + Send>>
+) -> Pin<Box<dyn Future<Output = ResultNodes<FE, V>> + Send>>
 where
     C: Collate<Value = V> + Clone + Send + Sync + 'static,
     V: Clone + PartialEq + fmt::Debug + Send + Sync + 'static,
@@ -904,7 +918,7 @@ where
     let file = dir.as_dir().get_file(&node_id).expect("node").clone();
     let fut = file.into_read().map_ok(move |node| {
         let read = match &*node {
-            Node::Leaf(keys) if range.is_default() => NodeRead::Leaf((0, keys.len())),
+            Node::Leaf(keys) if range.is_empty() => NodeRead::Leaf((0, keys.len())),
             Node::Leaf(keys) => {
                 let (l, r) = keys.bisect(&range, &collator);
 
@@ -920,13 +934,13 @@ where
                     NodeRead::Leaf((l, r))
                 }
             }
-            Node::Index(_bounds, children) if range.is_default() => {
+            Node::Index(_bounds, children) if range.is_empty() => {
                 debug_assert!(!children.is_empty());
 
                 if children.len() == 1 {
                     NodeRead::Child(children[0])
                 } else {
-                    NodeRead::Children(SmallVec::from_slice(&children))
+                    NodeRead::Children(Box::new(SmallVec::from_slice(children)))
                 }
             }
             Node::Index(bounds, children) => {
@@ -942,7 +956,7 @@ where
                 } else if l == r || l + 1 == r {
                     NodeRead::Child(children[l])
                 } else {
-                    NodeRead::Children(SmallVec::from_slice(&children[l..r]))
+                    NodeRead::Children(Box::new(SmallVec::from_slice(&children[l..r])))
                 }
             }
         };
@@ -1053,7 +1067,7 @@ where
 
         let new_root = match &mut *root {
             Node::Leaf(keys) => {
-                let i = keys.bisect_left(&key, &self.collator);
+                let i = keys.bisect_left(key, &self.collator);
                 if i < keys.len() && keys[i].iter().zip(key).all(|(l, r)| l == r.borrow()) {
                     keys.remove(i);
                     return Ok(true);
@@ -1062,13 +1076,13 @@ where
                 }
             }
             Node::Index(bounds, children) => {
-                let i = match bounds.bisect_right(&key, &self.collator) {
+                let i = match bounds.bisect_right(key, &self.collator) {
                     0 => return Ok(false),
                     i => i - 1,
                 };
 
                 let node = self.dir.write_file_owned(&children[i]).await?;
-                match self.delete_inner(node, &key).await? {
+                match self.delete_inner(node, key).await? {
                     Delete::None => return Ok(false),
                     Delete::Right => return Ok(true),
                     Delete::Left(bound) => {
@@ -1099,9 +1113,9 @@ where
             let new_root = {
                 let mut child = self.dir.write_file(&only_child).await?;
                 match &mut *child {
-                    Node::Leaf(keys) => Node::Leaf(keys.drain(..).collect()),
+                    Node::Leaf(keys) => Node::Leaf(mem::take(keys)),
                     Node::Index(bounds, children) => {
-                        Node::Index(bounds.drain(..).collect(), children.drain(..).collect())
+                        Node::Index(mem::take(bounds), mem::take(children))
                     }
                 }
             };
@@ -1118,14 +1132,14 @@ where
         &'a mut self,
         mut node: FileWriteGuardOwned<FE, Node<S::Value>>,
         key: &'a [V],
-    ) -> Pin<Box<dyn Future<Output = Result<Delete<FE, S::Value>, io::Error>> + Send + 'a>>
+    ) -> Pin<Box<dyn Future<Output = ResultDelete<FE, S::Value>> + Send + 'a>>
     where
         V: Borrow<S::Value> + Send + Sync,
     {
         Box::pin(async move {
             match &mut *node {
                 Node::Leaf(keys) => {
-                    let i = keys.bisect_left(&key, &self.collator);
+                    let i = keys.bisect_left(key, &self.collator);
 
                     if i < keys.len() && keys[i].iter().zip(key).all(|(l, r)| l == r.borrow()) {
                         keys.remove(i);
@@ -1235,8 +1249,7 @@ where
         left_bounds: &'a mut Vec<Vec<S::Value>>,
         left_children: &'a mut Vec<Uuid>,
         node_id: &'a Uuid,
-    ) -> Pin<Box<dyn Future<Output = Result<MergeIndexLeft<S::Value>, io::Error>> + Send + 'a>>
-    {
+    ) -> Pin<Box<dyn Future<Output = ResultMergeIndex<S::Value>> + Send + 'a>> {
         Box::pin(async move {
             let mut node = self.dir.write_file(node_id).await?;
 
@@ -1251,14 +1264,14 @@ where
                         let mut new_bounds =
                             Vec::with_capacity(left_bounds.len() + right_bounds.len());
 
-                        new_bounds.extend(left_bounds.drain(..));
-                        new_bounds.extend(right_bounds.drain(..));
+                        new_bounds.append(left_bounds);
+                        new_bounds.append(right_bounds);
                         *right_bounds = new_bounds;
 
                         let mut new_children = Vec::with_capacity(right_bounds.len());
 
-                        new_children.extend(left_children.drain(..));
-                        new_children.extend(right_children.drain(..));
+                        new_children.append(left_children);
+                        new_children.append(right_children);
                         *right_children = new_children;
 
                         Ok(MergeIndexLeft::Merge(right_bounds[0].to_vec()))
@@ -1289,8 +1302,8 @@ where
 
                         Ok(MergeIndexRight::Borrow)
                     } else {
-                        left_bounds.extend(right_bounds.drain(..));
-                        left_children.extend(right_children.drain(..));
+                        left_bounds.append(right_bounds);
+                        left_children.append(right_children);
                         Ok(MergeIndexRight::Merge)
                     }
                 }
@@ -1340,7 +1353,7 @@ where
         &'a self,
         left_keys: &'a mut Vec<Vec<S::Value>>,
         node_id: &'a Uuid,
-    ) -> Pin<Box<dyn Future<Output = Result<MergeLeafLeft<S::Value>, io::Error>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = ResultMergeLeaf<S::Value>> + Send + 'a>> {
         Box::pin(async move {
             let mut node = self.dir.write_file(node_id).await?;
 
@@ -1351,8 +1364,8 @@ where
                         Ok(MergeLeafLeft::Borrow(right_keys[0].to_vec()))
                     } else {
                         let mut new_keys = Vec::with_capacity(left_keys.len() + right_keys.len());
-                        new_keys.extend(left_keys.drain(..));
-                        new_keys.extend(right_keys.drain(..));
+                        new_keys.append(left_keys);
+                        new_keys.append(right_keys);
                         *right_keys = new_keys;
 
                         Ok(MergeLeafLeft::Merge(right_keys[0].to_vec()))
@@ -1389,7 +1402,7 @@ where
                         right_keys.insert(0, right);
                         Ok(MergeLeafRight::Borrow)
                     } else {
-                        left_keys.extend(right_keys.drain(..));
+                        left_keys.append(right_keys);
                         Ok(MergeLeafRight::Merge)
                     }
                 }
@@ -1432,7 +1445,7 @@ where
                     let right_key = right[0].clone();
                     let (right, _) = self.dir.create_file_unique(Node::Leaf(right), size)?;
 
-                    let left: Vec<_> = keys.drain(..).collect();
+                    let left: Vec<_> = mem::take(keys);
                     debug_assert!(left.len() >= mid);
 
                     let left_key = left[0].clone();
@@ -1483,8 +1496,8 @@ where
                         .dir
                         .create_file_unique(Node::Index(right_bounds, right_children), size)?;
 
-                    let left_bounds: Vec<_> = bounds.drain(..).collect();
-                    let left_children: Vec<_> = children.drain(..).collect();
+                    let left_bounds: Vec<_> = mem::take(bounds);
+                    let left_children: Vec<_> = mem::take(children);
                     let left_bound = left_bounds[0].clone();
                     let (left_node_id, _) = self
                         .dir
@@ -1511,7 +1524,7 @@ where
         &'a mut self,
         node: &'a mut Node<S::Value>,
         key: Vec<S::Value>,
-    ) -> Pin<Box<dyn Future<Output = Result<Insert<S::Value>, io::Error>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = ResultInsert<S::Value>> + Send + 'a>> {
         Box::pin(async move {
             let order = self.schema.order();
 
@@ -1657,7 +1670,7 @@ where
         validate_collator_eq(&self.collator, &other.collator)?;
         validate_schema_eq(&self.schema, &other.schema)?;
 
-        let mut keys = other.keys(Range::<S::Value>::default(), false).await?;
+        let mut keys = other.keys(Range::<S::Value>::default()).await?;
         while let Some(key) = keys.try_next().await? {
             self.insert_root(key.into_vec()).await?;
         }
@@ -1675,7 +1688,7 @@ where
         validate_collator_eq(&self.collator, &other.collator)?;
         validate_schema_eq(&self.schema, &other.schema)?;
 
-        let mut keys = other.keys(Range::<S::Value>::default(), false).await?;
+        let mut keys = other.keys(Range::<S::Value>::default()).await?;
         while let Some(key) = keys.try_next().await? {
             self.delete(&key).await?;
         }
@@ -1708,8 +1721,7 @@ where
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "B+Tree to merge must have the same collation",
-        )
-        .into())
+        ))
     }
 }
 
@@ -1727,8 +1739,7 @@ where
                 "cannot merge a B+Tree with schema {:?} into one with schema {:?}",
                 that, this
             ),
-        )
-        .into())
+        ))
     }
 }
 

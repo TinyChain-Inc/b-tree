@@ -65,22 +65,19 @@ impl<V> Range<V> {
 
     /// Return `false` if this [`Range`] has only a prefix.
     pub fn has_bounds(&self) -> bool {
-        match (&self.start, &self.end) {
-            (Bound::Unbounded, Bound::Unbounded) => false,
-            _ => true,
-        }
+        !matches!(
+            (&self.start, &self.end),
+            (Bound::Unbounded, Bound::Unbounded)
+        )
     }
 
     /// Return `true` if this [`Range`] is empty.
-    pub fn is_default(&self) -> bool {
-        if self.prefix.is_empty() {
-            match (&self.start, &self.end) {
-                (Bound::Unbounded, Bound::Unbounded) => true,
-                _ => false,
-            }
-        } else {
-            false
-        }
+    pub fn is_empty(&self) -> bool {
+        self.prefix.is_empty()
+            && matches!(
+                (&self.start, &self.end),
+                (Bound::Unbounded, Bound::Unbounded)
+            )
     }
 
     /// Return the number of columns specified by this [`Range`].
@@ -188,8 +185,8 @@ impl<C: Collate> OverlapsRange<Range<C::Value>, Collator<C>> for Range<C::Value>
         }
 
         match collator.cmp_slices(&self.prefix, &other.prefix) {
-            Ordering::Less => return Overlap::Less,
-            Ordering::Greater => return Overlap::Greater,
+            Ordering::Less => Overlap::Less,
+            Ordering::Greater => Overlap::Greater,
             Ordering::Equal => match self.prefix.len().cmp(&other.prefix.len()) {
                 Ordering::Less => {
                     let value = &other.prefix[self.prefix.len()];

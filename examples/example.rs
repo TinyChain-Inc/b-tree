@@ -2,12 +2,11 @@ use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::{fmt, io};
 
-use async_trait::async_trait;
 use collate::Collator;
 use destream::{de, en};
 use freqfs::Cache;
 use futures::{TryFutureExt, TryStreamExt};
-use rand::Rng;
+use rand::RngExt;
 use safecast::as_type;
 use smallvec::smallvec;
 use tokio::fs;
@@ -16,11 +15,11 @@ use b_tree::{BTreeLock, Node, Range, Schema};
 
 const BLOCK_SIZE: usize = 4_096;
 
+#[derive(Clone)]
 enum File {
     Node(Node<Vec<Vec<i16>>>),
 }
 
-#[async_trait]
 impl de::FromStream for File {
     type Context = ();
 
@@ -88,12 +87,16 @@ impl<T: fmt::Debug> Schema for ExampleSchema<T> {
             ))
         }
     }
+
+    fn is_empty(&self) -> bool {
+        self.size == 0
+    }
 }
 
 async fn setup_tmp_dir() -> Result<PathBuf, io::Error> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     loop {
-        let rand: u32 = rng.gen();
+        let rand: u32 = rng.random();
         let path = PathBuf::from(format!("/tmp/test_btree_{}", rand));
         if !path.exists() {
             fs::create_dir(&path).await?;
@@ -163,7 +166,7 @@ async fn functional_test() -> Result<(), io::Error> {
 
         {
             let range = Range::with_range(vec![], 0..67);
-            let mut keys = view.clone().keys(range, false).await?;
+            let mut keys = view.clone().keys(range).await?;
             while let Some(key) = keys.try_next().await? {
                 assert_eq!(key[0], i);
                 i += 1;
@@ -172,7 +175,7 @@ async fn functional_test() -> Result<(), io::Error> {
 
         {
             let range = Range::with_range(vec![], 67..250);
-            let mut keys = view.clone().keys(range, false).await?;
+            let mut keys = view.clone().keys(range).await?;
             while let Some(key) = keys.try_next().await? {
                 assert_eq!(key[0], i);
                 i += 1;
@@ -182,10 +185,7 @@ async fn functional_test() -> Result<(), io::Error> {
         let mut i = 1;
 
         {
-            let mut keys = view
-                .clone()
-                .keys(Range::with_range(vec![], 0..123), false)
-                .await?;
+            let mut keys = view.clone().keys(Range::with_range(vec![], 0..123)).await?;
 
             while let Some(key) = keys.try_next().await? {
                 assert_eq!(key[0], i);
@@ -194,7 +194,7 @@ async fn functional_test() -> Result<(), io::Error> {
         }
 
         {
-            let mut keys = view.keys(Range::with_range(vec![], 123..n), false).await?;
+            let mut keys = view.keys(Range::with_range(vec![], 123..n)).await?;
             while let Some(key) = keys.try_next().await? {
                 assert_eq!(key[0], i);
                 i += 1;
@@ -221,7 +221,7 @@ async fn functional_test() -> Result<(), io::Error> {
 
         {
             let mut i = n - 1;
-            let mut reversed = view.clone().keys(Range::<i16>::default(), true).await?;
+            let mut reversed = view.clone().keys_rev(Range::<i16>::default()).await?;
             while let Some(key) = reversed.try_next().await? {
                 assert_eq!(key[0], i);
                 i -= 1;
@@ -271,7 +271,7 @@ async fn functional_test() -> Result<(), io::Error> {
             let lo = view.first(Range::<i16>::default()).await?.expect("first")[0];
             let hi = view.last(Range::<i16>::default()).await?.expect("last")[0];
 
-            let i = rand::thread_rng().gen_range(lo..(hi + 1));
+            let i = rand::rng().random_range(lo..(hi + 1));
             let key = [i, i16::MAX - i, i16::MAX - 2 * i];
 
             let present = view.contains(&key).await?;
@@ -293,7 +293,7 @@ async fn functional_test() -> Result<(), io::Error> {
         #[cfg(debug_assertions)]
         assert!(view.clone().is_valid().await?);
 
-        let mut keys = view.keys(Range::<i16>::default(), false).await?;
+        let mut keys = view.keys(Range::<i16>::default()).await?;
         assert_eq!(keys.try_next().await?, None);
     }
 
@@ -326,23 +326,23 @@ async fn load_test() -> Result<(), io::Error> {
         assert_eq!(view.count(&Range::<i16>::default()).await?, 0);
 
         for _ in 0..(n / 2) {
-            let i: i16 = rand::thread_rng().gen_range(i16::MIN..i16::MAX);
+            let i: i16 = rand::rng().random_range(i16::MIN..i16::MAX);
             let key = vec![i, i / 2, i % 2];
             view.insert(key).await?;
         }
 
         for _ in (n / 2)..n {
-            let i: i16 = rand::thread_rng().gen_range(i16::MIN..i16::MAX);
+            let i: i16 = rand::rng().random_range(i16::MIN..i16::MAX);
             let key = vec![i, i / 2, i % 2];
             view.insert(key).await?;
 
-            let i: i16 = rand::thread_rng().gen_range(i16::MIN..i16::MAX);
+            let i: i16 = rand::rng().random_range(i16::MIN..i16::MAX);
             let key = [i, i / 2, i % 2];
             view.delete(&key).await?;
         }
 
         for _ in 0..(n / 2) {
-            let i: i16 = rand::thread_rng().gen_range(i16::MIN..i16::MAX);
+            let i: i16 = rand::rng().random_range(i16::MIN..i16::MAX);
             let key = [i, i / 2, i % 2];
             view.delete(&key).await?;
         }
