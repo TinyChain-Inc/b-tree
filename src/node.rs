@@ -8,8 +8,8 @@ use destream::{de, en};
 use get_size::GetSize;
 use uuid::Uuid;
 
-use super::range::Range;
 use super::Collator;
+use super::range::Range;
 
 const UUID_SIZE: usize = 16;
 
@@ -47,11 +47,15 @@ impl<V: fmt::Debug> Block<V> for Vec<Vec<V>> {
             return (0, self.len());
         }
 
-        if let Some(first) = self.first() && range.overlaps_value(first, collator) == Overlap::Less {
+        if let Some(first) = self.first()
+            && range.overlaps_value(first, collator) == Overlap::Less
+        {
             return (0, 0);
         }
 
-        if let Some(last) = self.last() && range.overlaps_value(last, collator) == Overlap::Greater {
+        if let Some(last) = self.last()
+            && range.overlaps_value(last, collator) == Overlap::Greater
+        {
             return (self.len(), self.len());
         }
 

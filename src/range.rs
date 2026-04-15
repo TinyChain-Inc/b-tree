@@ -65,12 +65,19 @@ impl<V> Range<V> {
 
     /// Return `false` if this [`Range`] has only a prefix.
     pub fn has_bounds(&self) -> bool {
-        !matches!((&self.start, &self.end), (Bound::Unbounded, Bound::Unbounded))
+        !matches!(
+            (&self.start, &self.end),
+            (Bound::Unbounded, Bound::Unbounded)
+        )
     }
 
     /// Return `true` if this [`Range`] is empty.
     pub fn is_default(&self) -> bool {
-        self.prefix.is_empty() && matches!((&self.start, &self.end), (Bound::Unbounded, Bound::Unbounded))
+        self.prefix.is_empty()
+            && matches!(
+                (&self.start, &self.end),
+                (Bound::Unbounded, Bound::Unbounded)
+            )
     }
 
     /// Return `true` if this [`Range`] is empty.

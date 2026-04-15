@@ -1,27 +1,20 @@
 use std::borrow::Borrow;
+use std::mem;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{fmt, io};
-use std::mem;
 
 use collate::{Collate, OverlapsValue};
 #[cfg(feature = "stream")]
 use destream::de;
 use freqfs::{
-    DirReadGuardOwned, 
-    DirWriteGuardOwned,
-    FileReadGuardOwned,
-    FileWriteGuardOwned,
-    DirLock,
-    FileLoad,
-    FileSave,
-    DirDeref,
-    FileReadGuard,
+    DirDeref, DirLock, DirReadGuardOwned, DirWriteGuardOwned, FileLoad, FileReadGuard,
+    FileReadGuardOwned, FileSave, FileWriteGuardOwned,
 };
+use futures::TryFutureExt;
 use futures::future::{self, Future, FutureExt};
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use futures::try_join;
-use futures::TryFutureExt;
 use safecast::AsType;
 use smallvec::SmallVec;
 use uuid::Uuid;
@@ -29,7 +22,7 @@ use uuid::Uuid;
 use super::group::GroupBy;
 use super::node::Block;
 use super::range::Range;
-use super::{Collator, Key, Schema, NODE_STACK_SIZE};
+use super::{Collator, Key, NODE_STACK_SIZE, Schema};
 
 type NodeStack<V> = SmallVec<[Key<V>; NODE_STACK_SIZE]>;
 
@@ -484,7 +477,9 @@ where
 
         let mut node = self.dir.as_dir().read_file(&ROOT).await?;
 
-        if let Node::Leaf(keys) = &*node && keys.is_empty() {
+        if let Node::Leaf(keys) = &*node
+            && keys.is_empty()
+        {
             return Ok(None);
         }
 
@@ -532,7 +527,9 @@ where
 
         let mut node = self.dir.as_dir().read_file(&ROOT).await?;
 
-        if let Node::Leaf(keys) = &*node && keys.is_empty() {
+        if let Node::Leaf(keys) = &*node
+            && keys.is_empty()
+        {
             return Ok(None);
         }
 
@@ -1248,8 +1245,7 @@ where
         left_bounds: &'a mut Vec<Vec<S::Value>>,
         left_children: &'a mut Vec<Uuid>,
         node_id: &'a Uuid,
-    ) -> Pin<Box<dyn Future<Output = ResultMergeIndex<S::Value>> + Send + 'a>>
-    {
+    ) -> Pin<Box<dyn Future<Output = ResultMergeIndex<S::Value>> + Send + 'a>> {
         Box::pin(async move {
             let mut node = self.dir.write_file(node_id).await?;
 
