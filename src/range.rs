@@ -72,17 +72,12 @@ impl<V> Range<V> {
     }
 
     /// Return `true` if this [`Range`] is empty.
-    pub fn is_default(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.prefix.is_empty()
             && matches!(
                 (&self.start, &self.end),
                 (Bound::Unbounded, Bound::Unbounded)
             )
-    }
-
-    /// Return `true` if this [`Range`] is empty.
-    pub fn is_empty(&self) -> bool {
-        self.is_default()
     }
 
     /// Return the number of columns specified by this [`Range`].

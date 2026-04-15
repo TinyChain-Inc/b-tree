@@ -396,7 +396,7 @@ where
     {
         Box::pin(async move {
             match &*node {
-                Node::Leaf(keys) if range.is_default() => Ok(keys.len() as u64),
+                Node::Leaf(keys) if range.is_empty() => Ok(keys.len() as u64),
                 Node::Leaf(keys) => {
                     let (l, r) = keys.bisect(range, &self.collator);
 
@@ -412,7 +412,7 @@ where
                         Ok((r - l) as u64)
                     }
                 }
-                Node::Index(_bounds, children) if range.is_default() => {
+                Node::Index(_bounds, children) if range.is_empty() => {
                     stream::iter(children)
                         .then(|node_id| self.dir.as_dir().read_file(node_id))
                         .map_ok(|node| self.count_inner(range, node))
@@ -640,11 +640,7 @@ where
     Node<S::Value>: FileLoad + fmt::Debug,
 {
     /// Construct a [`Stream`] of all the keys in the given `range` of this B+Tree.
-    pub async fn keys<BV>(
-        self,
-        range: Range<BV>,
-        reverse: bool,
-    ) -> Result<Keys<S::Value>, io::Error>
+    pub async fn keys<BV>(self, range: Range<BV>) -> Result<Keys<S::Value>, io::Error>
     where
         BV: Borrow<S::Value> + Clone + Send + Sync + 'static,
     {
@@ -653,41 +649,49 @@ where
             "B+Tree is missing its root node"
         );
 
-        if reverse {
-            let nodes = nodes_reverse(self.dir, self.collator, range, ROOT).await?;
+        let nodes = nodes_forward(self.dir, self.collator, range, ROOT).await?;
 
-            let keys = nodes
-                .map_ok(|leaf| async move {
-                    let mut keys = NodeStack::with_capacity(leaf.as_ref().len());
+        let keys = nodes
+            .map_ok(move |leaf| async move {
+                let mut keys = NodeStack::with_capacity(leaf.as_ref().len());
 
-                    for key in leaf.as_ref().iter().rev() {
-                        keys.push(key.iter().cloned().collect());
-                    }
+                for key in leaf.as_ref() {
+                    keys.push(key.iter().cloned().collect())
+                }
 
-                    Ok(stream::iter(keys).map(Ok))
-                })
-                .try_buffered(num_cpus::get())
-                .try_flatten();
+                Ok(stream::iter(keys).map(Ok))
+            })
+            .try_buffered(num_cpus::get())
+            .try_flatten();
 
-            Ok(Box::pin(keys))
-        } else {
-            let nodes = nodes_forward(self.dir, self.collator, range, ROOT).await?;
+        Ok(Box::pin(keys))
+    }
 
-            let keys = nodes
-                .map_ok(|leaf| async move {
-                    let mut keys = NodeStack::with_capacity(leaf.as_ref().len());
+    pub async fn keys_rev<BV>(self, range: Range<BV>) -> Result<Keys<S::Value>, io::Error>
+    where
+        BV: Borrow<S::Value> + Clone + Send + Sync + 'static,
+    {
+        debug_assert!(
+            self.dir.as_dir().contains(&ROOT),
+            "B+Tree is missing its root node"
+        );
 
-                    for key in leaf.as_ref() {
-                        keys.push(key.iter().cloned().collect());
-                    }
+        let nodes = nodes_reverse(self.dir, self.collator, range, ROOT).await?;
 
-                    Ok(stream::iter(keys).map(Ok))
-                })
-                .try_buffered(num_cpus::get())
-                .try_flatten();
+        let keys = nodes
+            .map_ok(|leaf| async move {
+                let mut keys = NodeStack::with_capacity(leaf.as_ref().len());
 
-            Ok(Box::pin(keys))
-        }
+                for key in leaf.as_ref().iter().rev() {
+                    keys.push(key.iter().cloned().collect());
+                }
+
+                Ok(stream::iter(keys).map(Ok))
+            })
+            .try_buffered(num_cpus::get())
+            .try_flatten();
+
+        Ok(Box::pin(keys))
     }
 
     /// Construct a [`Stream`] of unique length-`n` prefixes within the given `range`.
@@ -761,7 +765,7 @@ where
         let default_range = Range::<S::Value>::default();
         let count = self.count(&default_range).await? as usize;
         let mut contents = Vec::with_capacity(count);
-        let mut stream = self.keys(default_range, false).await?;
+        let mut stream = self.keys(default_range).await?;
         while let Some(key) = stream.try_next().await? {
             contents.push(key);
         }
@@ -810,7 +814,7 @@ where
     let file = dir.as_dir().get_file(&node_id).expect("node").clone();
     let fut = file.into_read().map_ok(move |node| {
         let read = match &*node {
-            Node::Leaf(keys) if range.is_default() => NodeRead::Leaf((0, keys.len())),
+            Node::Leaf(keys) if range.is_empty() => NodeRead::Leaf((0, keys.len())),
             Node::Leaf(keys) => {
                 let (l, r) = keys.bisect(&range, &collator);
 
@@ -826,7 +830,7 @@ where
                     NodeRead::Leaf((l, r))
                 }
             }
-            Node::Index(_bounds, children) if range.is_default() => {
+            Node::Index(_bounds, children) if range.is_empty() => {
                 debug_assert!(!children.is_empty());
 
                 if children.len() == 1 {
@@ -914,7 +918,7 @@ where
     let file = dir.as_dir().get_file(&node_id).expect("node").clone();
     let fut = file.into_read().map_ok(move |node| {
         let read = match &*node {
-            Node::Leaf(keys) if range.is_default() => NodeRead::Leaf((0, keys.len())),
+            Node::Leaf(keys) if range.is_empty() => NodeRead::Leaf((0, keys.len())),
             Node::Leaf(keys) => {
                 let (l, r) = keys.bisect(&range, &collator);
 
@@ -930,7 +934,7 @@ where
                     NodeRead::Leaf((l, r))
                 }
             }
-            Node::Index(_bounds, children) if range.is_default() => {
+            Node::Index(_bounds, children) if range.is_empty() => {
                 debug_assert!(!children.is_empty());
 
                 if children.len() == 1 {
@@ -1666,7 +1670,7 @@ where
         validate_collator_eq(&self.collator, &other.collator)?;
         validate_schema_eq(&self.schema, &other.schema)?;
 
-        let mut keys = other.keys(Range::<S::Value>::default(), false).await?;
+        let mut keys = other.keys(Range::<S::Value>::default()).await?;
         while let Some(key) = keys.try_next().await? {
             self.insert_root(key.into_vec()).await?;
         }
@@ -1684,7 +1688,7 @@ where
         validate_collator_eq(&self.collator, &other.collator)?;
         validate_schema_eq(&self.schema, &other.schema)?;
 
-        let mut keys = other.keys(Range::<S::Value>::default(), false).await?;
+        let mut keys = other.keys(Range::<S::Value>::default()).await?;
         while let Some(key) = keys.try_next().await? {
             self.delete(&key).await?;
         }

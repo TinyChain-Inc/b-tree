@@ -43,7 +43,7 @@ impl<V: fmt::Debug> Block<V> for Vec<Vec<V>> {
     {
         // handle common edge cases
 
-        if range.is_default() {
+        if range.is_empty() {
             return (0, self.len());
         }
 
