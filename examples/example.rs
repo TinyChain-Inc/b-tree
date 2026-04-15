@@ -166,7 +166,7 @@ async fn functional_test() -> Result<(), io::Error> {
 
         {
             let range = Range::with_range(vec![], 0..67);
-            let mut keys = view.clone().keys(range, false).await?;
+            let mut keys = view.clone().keys(range).await?;
             while let Some(key) = keys.try_next().await? {
                 assert_eq!(key[0], i);
                 i += 1;
@@ -175,7 +175,7 @@ async fn functional_test() -> Result<(), io::Error> {
 
         {
             let range = Range::with_range(vec![], 67..250);
-            let mut keys = view.clone().keys(range, false).await?;
+            let mut keys = view.clone().keys(range).await?;
             while let Some(key) = keys.try_next().await? {
                 assert_eq!(key[0], i);
                 i += 1;
@@ -185,10 +185,7 @@ async fn functional_test() -> Result<(), io::Error> {
         let mut i = 1;
 
         {
-            let mut keys = view
-                .clone()
-                .keys(Range::with_range(vec![], 0..123), false)
-                .await?;
+            let mut keys = view.clone().keys(Range::with_range(vec![], 0..123)).await?;
 
             while let Some(key) = keys.try_next().await? {
                 assert_eq!(key[0], i);
@@ -197,7 +194,7 @@ async fn functional_test() -> Result<(), io::Error> {
         }
 
         {
-            let mut keys = view.keys(Range::with_range(vec![], 123..n), false).await?;
+            let mut keys = view.keys(Range::with_range(vec![], 123..n)).await?;
             while let Some(key) = keys.try_next().await? {
                 assert_eq!(key[0], i);
                 i += 1;
@@ -224,7 +221,7 @@ async fn functional_test() -> Result<(), io::Error> {
 
         {
             let mut i = n - 1;
-            let mut reversed = view.clone().keys(Range::<i16>::default(), true).await?;
+            let mut reversed = view.clone().keys_rev(Range::<i16>::default()).await?;
             while let Some(key) = reversed.try_next().await? {
                 assert_eq!(key[0], i);
                 i -= 1;
@@ -296,7 +293,7 @@ async fn functional_test() -> Result<(), io::Error> {
         #[cfg(debug_assertions)]
         assert!(view.clone().is_valid().await?);
 
-        let mut keys = view.keys(Range::<i16>::default(), false).await?;
+        let mut keys = view.keys(Range::<i16>::default()).await?;
         assert_eq!(keys.try_next().await?, None);
     }
 
