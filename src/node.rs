@@ -47,16 +47,12 @@ impl<V: fmt::Debug> Block<V> for Vec<Vec<V>> {
             return (0, self.len());
         }
 
-        if let Some(first) = self.first() {
-            if range.overlaps_value(first, collator) == Overlap::Less {
-                return (0, 0);
-            }
+        if let Some(first) = self.first() && range.overlaps_value(first, collator) == Overlap::Less {
+            return (0, 0);
         }
 
-        if let Some(last) = self.last() {
-            if range.overlaps_value(last, collator) == Overlap::Greater {
-                return (self.len(), self.len());
-            }
+        if let Some(last) = self.last() && range.overlaps_value(last, collator) == Overlap::Greater {
+            return (self.len(), self.len());
         }
 
         // bisect range left
@@ -140,10 +136,7 @@ pub enum Node<N> {
 impl<N> Node<N> {
     /// Return `true` if this is a leaf node.
     pub fn is_leaf(&self) -> bool {
-        match self {
-            Self::Leaf(_) => true,
-            _ => false,
-        }
+        matches!(self, Self::Leaf(_))
     }
 }
 
