@@ -1,6 +1,6 @@
 [package]
 name = "b-tree"
-version = "0.4.0"
+version = "0.5.0"
 authors = ["code@tinychain.net"]
 edition = "2024"
 description = "A persistent B+ tree using freqfs"
