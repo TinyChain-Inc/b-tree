@@ -477,10 +477,10 @@ where
 
         let mut node = self.dir.as_dir().read_file(&ROOT).await?;
 
-        if let Node::Leaf(keys) = &*node
-            && keys.is_empty()
-        {
-            return Ok(None);
+        if let Node::Leaf(keys) = &*node {
+            if keys.is_empty() {
+                return Ok(None);
+            }
         }
 
         Ok(loop {
@@ -527,10 +527,10 @@ where
 
         let mut node = self.dir.as_dir().read_file(&ROOT).await?;
 
-        if let Node::Leaf(keys) = &*node
-            && keys.is_empty()
-        {
-            return Ok(None);
+        if let Node::Leaf(keys) = &*node {
+            if keys.is_empty() {
+                return Ok(None);
+            }
         }
 
         Ok(loop {
