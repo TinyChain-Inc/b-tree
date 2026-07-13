@@ -21,7 +21,7 @@ name = "example"
 required-features = ["stream"]
 
 [dependencies]
-collate = "0.4"
+collate = { path = "../collate", version = "0.4" }
 destream = { version = "0.10.1", optional = true }
 freqfs = "0.12"
 futures = "0.3"
