@@ -87,10 +87,6 @@ impl<T: fmt::Debug> Schema for ExampleSchema<T> {
             ))
         }
     }
-
-    fn is_empty(&self) -> bool {
-        self.size == 0
-    }
 }
 
 async fn setup_tmp_dir() -> Result<PathBuf, io::Error> {
