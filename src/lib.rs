@@ -93,7 +93,11 @@ where
 
 impl<C> Eq for Collator<C> where C: Collate {}
 
-/// The schema of a B+Tree
+/// The schema of a B+Tree.
+///
+/// A schema always has at least one key column, so `len` does not imply a
+/// meaningful `is_empty` operation.
+#[allow(clippy::len_without_is_empty)]
 pub trait Schema: Eq + fmt::Debug {
     /// The type of error returned by [`Schema::validate_key`]
     type Error: std::error::Error + Send + Sync + 'static;
@@ -104,7 +108,7 @@ pub trait Schema: Eq + fmt::Debug {
     /// Get the maximum size in bytes of a leaf node in a B+Tree with this [`Schema`].
     fn block_size(&self) -> usize;
 
-    /// Get the number of columns in this [`Schema`].
+    /// Get the number of values in each key.
     fn len(&self) -> usize;
 
     /// Get the order of the nodes in a B+Tree with this [`Schema`].
