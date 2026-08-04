@@ -47,16 +47,18 @@ impl<V: fmt::Debug> Block<V> for Vec<Vec<V>> {
             return (0, self.len());
         }
 
-        if let Some(first) = self.first() {
-            if range.overlaps_value(first, collator) == Overlap::Less {
+        match self.first() {
+            Some(first) if range.overlaps_value(first, collator) == Overlap::Less => {
                 return (0, 0);
             }
+            _ => {}
         }
 
-        if let Some(last) = self.last() {
-            if range.overlaps_value(last, collator) == Overlap::Greater {
+        match self.last() {
+            Some(last) if range.overlaps_value(last, collator) == Overlap::Greater => {
                 return (self.len(), self.len());
             }
+            _ => {}
         }
 
         // bisect range left
