@@ -109,7 +109,12 @@ async fn functional_test() -> Result<(), io::Error> {
     let schema = ExampleSchema::<i16>::new(3);
 
     // initialize the cache
-    let cache = Cache::<File>::new(schema.block_size(), None, 0, std::time::Duration::from_secs(3));
+    let cache = Cache::<File>::new(
+        schema.block_size(),
+        None,
+        0,
+        std::time::Duration::from_secs(3),
+    );
 
     // load the directory and file paths into memory (not file contents, yet)
     let dir = cache.load(path.clone())?;
@@ -307,7 +312,12 @@ async fn load_test() -> Result<(), io::Error> {
     let schema = ExampleSchema::<i16>::new(3);
 
     // initialize the cache
-    let cache = Cache::<File>::new(schema.block_size() * n, None, 0, std::time::Duration::from_secs(3));
+    let cache = Cache::<File>::new(
+        schema.block_size() * n,
+        None,
+        0,
+        std::time::Duration::from_secs(3),
+    );
 
     // load the directory and file paths into memory (not file contents, yet)
     let dir = cache.load(path.clone())?;
