@@ -108,7 +108,7 @@ impl<S, C, FE> BTreeLock<S, C, FE> {
 impl<S, C, FE> BTreeLock<S, C, FE>
 where
     S: Schema,
-    FE: AsType<Node<S::Value>> + Send + Sync,
+    FE: AsType<Node<S::Value>> + From<Node<S::Value>> + Send + Sync,
     Node<S::Value>: FileLoad,
 {
     fn new(schema: S, collator: C, dir: DirLock<FE>) -> Self {
@@ -124,7 +124,7 @@ where
         let mut nodes = dir.try_write_owned()?;
 
         if nodes.is_empty() {
-            nodes.create_file::<Node<S::Value>>(ROOT.to_string(), Node::Leaf(vec![]), 0)?;
+            nodes.create_empty_file::<Node<S::Value>>(ROOT.to_string(), Node::Leaf(vec![]))?;
 
             debug_assert!(nodes.contains(&ROOT), "B+Tree failed to create a root node");
 
@@ -142,7 +142,7 @@ where
         let mut nodes = dir.try_write_owned()?;
 
         if !nodes.contains(&ROOT) {
-            nodes.create_file(ROOT.to_string(), Node::Leaf(vec![]), 0)?;
+            nodes.create_empty_file(ROOT.to_string(), Node::Leaf(vec![]))?;
         }
 
         debug_assert!(nodes.contains(&ROOT), "B+Tree failed to create a root node");
@@ -1441,13 +1441,19 @@ where
                     debug_assert!(right.len() >= mid);
 
                     let right_key = right[0].clone();
-                    let (right, _) = self.dir.create_file_unique(Node::Leaf(right), size)?;
+                    let (right, _) = self
+                        .dir
+                        .create_file_unique(Node::Leaf(right), size)
+                        .await?;
 
                     let left: Vec<_> = mem::take(keys);
                     debug_assert!(left.len() >= mid);
 
                     let left_key = left[0].clone();
-                    let (left, _) = self.dir.create_file_unique(Node::Leaf(left), size)?;
+                    let (left, _) = self
+                        .dir
+                        .create_file_unique(Node::Leaf(left), size)
+                        .await?;
 
                     Some(Node::Index(vec![left_key, right_key], vec![left, right]))
                 } else {
@@ -1492,14 +1498,16 @@ where
                     let right_bound = right_bounds[0].clone();
                     let (right_node_id, _) = self
                         .dir
-                        .create_file_unique(Node::Index(right_bounds, right_children), size)?;
+                        .create_file_unique(Node::Index(right_bounds, right_children), size)
+                        .await?;
 
                     let left_bounds: Vec<_> = mem::take(bounds);
                     let left_children: Vec<_> = mem::take(children);
                     let left_bound = left_bounds[0].clone();
                     let (left_node_id, _) = self
                         .dir
-                        .create_file_unique(Node::Index(left_bounds, left_children), size)?;
+                        .create_file_unique(Node::Index(left_bounds, left_children), size)
+                        .await?;
 
                     Some(Node::Index(
                         vec![left_bound, right_bound],
@@ -1548,7 +1556,8 @@ where
 
                         let middle_key = new_leaf[0].to_vec();
                         let node = Node::Leaf(new_leaf);
-                        let (new_node_id, _) = self.dir.create_file_unique(node, size)?;
+                        let (new_node_id, _) =
+                            self.dir.create_file_unique(node, size).await?;
 
                         if i == 0 {
                             Ok(Insert::OverflowLeft(
@@ -1614,7 +1623,7 @@ where
 
                         let left_bound = new_bounds[0].to_vec();
                         let node = Node::Index(new_bounds, new_children);
-                        let (node_id, _) = self.dir.create_file_unique(node, size)?;
+                        let (node_id, _) = self.dir.create_file_unique(node, size).await?;
 
                         if overflow_left {
                             Ok(Insert::OverflowLeft(
@@ -1640,7 +1649,7 @@ where
         self.dir.truncate().await;
 
         self.dir
-            .create_file(ROOT.to_string(), Node::Leaf(vec![]), 0)?;
+            .create_empty_file(ROOT.to_string(), Node::Leaf(vec![]))?;
 
         debug_assert!(
             self.dir.contains(&ROOT),
