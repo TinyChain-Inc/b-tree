@@ -1441,19 +1441,13 @@ where
                     debug_assert!(right.len() >= mid);
 
                     let right_key = right[0].clone();
-                    let (right, _) = self
-                        .dir
-                        .create_file_unique(Node::Leaf(right), size)
-                        .await?;
+                    let (right, _) = self.dir.create_file_unique(Node::Leaf(right), size).await?;
 
                     let left: Vec<_> = mem::take(keys);
                     debug_assert!(left.len() >= mid);
 
                     let left_key = left[0].clone();
-                    let (left, _) = self
-                        .dir
-                        .create_file_unique(Node::Leaf(left), size)
-                        .await?;
+                    let (left, _) = self.dir.create_file_unique(Node::Leaf(left), size).await?;
 
                     Some(Node::Index(vec![left_key, right_key], vec![left, right]))
                 } else {
@@ -1556,8 +1550,7 @@ where
 
                         let middle_key = new_leaf[0].to_vec();
                         let node = Node::Leaf(new_leaf);
-                        let (new_node_id, _) =
-                            self.dir.create_file_unique(node, size).await?;
+                        let (new_node_id, _) = self.dir.create_file_unique(node, size).await?;
 
                         if i == 0 {
                             Ok(Insert::OverflowLeft(
