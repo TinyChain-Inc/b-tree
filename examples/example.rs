@@ -15,6 +15,45 @@ use b_tree::{BTreeLock, Node, Range, Schema};
 
 const BLOCK_SIZE: usize = 4_096;
 
+#[tokio::test]
+async fn load_requires_existing_root() -> Result<(), io::Error> {
+    let path = setup_tmp_dir().await?;
+    let cache = Cache::<File>::new(BLOCK_SIZE, None, 0, std::time::Duration::from_secs(3));
+    let dir = cache.load(path)?;
+    assert!(
+        BTreeLock::load(
+            ExampleSchema::<i16>::new(1),
+            Collator::<i16>::default(),
+            dir.clone()
+        )
+        .is_err()
+    );
+    assert!(dir.read().await.is_empty());
+    let tree = BTreeLock::create(
+        ExampleSchema::<i16>::new(1),
+        Collator::<i16>::default(),
+        dir.clone(),
+    )?;
+    tree.sync().await?;
+    assert!(
+        BTreeLock::load(
+            ExampleSchema::<i16>::new(1),
+            Collator::<i16>::default(),
+            dir.clone()
+        )
+        .is_ok()
+    );
+    assert!(
+        BTreeLock::create(
+            ExampleSchema::<i16>::new(1),
+            Collator::<i16>::default(),
+            dir
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
 #[derive(Clone)]
 enum File {
     Node(Node<Vec<Vec<i16>>>),
@@ -363,4 +402,29 @@ async fn main() -> Result<(), io::Error> {
     functional_test().await?;
     load_test().await?;
     Ok(())
+}
+
+impl freqfs::FileLoad for File {
+    async fn load(
+        _: &std::path::Path,
+        file: tokio::fs::File,
+        _: std::fs::Metadata,
+    ) -> std::io::Result<Self> {
+        tbon::de::read_from((), file)
+            .await
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+}
+impl freqfs::FileSave for File {
+    async fn save(&self, file: &mut tokio::fs::File) -> std::io::Result<u64> {
+        use futures::TryStreamExt;
+        use tokio::io::AsyncWriteExt;
+        let mut stream = tbon::en::encode(self).map_err(std::io::Error::other)?;
+        let mut size = 0;
+        while let Some(chunk) = stream.try_next().await.map_err(std::io::Error::other)? {
+            file.write_all(&chunk).await?;
+            size += chunk.len() as u64;
+        }
+        Ok(size)
+    }
 }

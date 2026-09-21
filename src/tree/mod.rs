@@ -108,8 +108,7 @@ impl<S, C, FE> BTreeLock<S, C, FE> {
 impl<S, C, FE> BTreeLock<S, C, FE>
 where
     S: Schema,
-    FE: AsType<Node<S::Value>> + From<Node<S::Value>> + Send + Sync,
-    Node<S::Value>: FileLoad,
+    FE: AsType<Node<S::Value>> + From<Node<S::Value>> + Send + Sync + FileLoad,
 {
     fn new(schema: S, collator: C, dir: DirLock<FE>) -> Self {
         Self {
@@ -139,13 +138,15 @@ where
 
     /// Load a [`BTreeLock`] with the given `schema` and `collator` from `dir`.
     pub fn load(schema: S, collator: C, dir: DirLock<FE>) -> Result<Self, io::Error> {
-        let mut nodes = dir.try_write_owned()?;
-
-        if !nodes.contains(&ROOT) {
-            nodes.create_empty_file(ROOT.to_string(), Node::Leaf(vec![]))?;
+        {
+            let nodes = dir.try_read()?;
+            if !nodes.contains(&ROOT) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing B+Tree root",
+                ));
+            }
         }
-
-        debug_assert!(nodes.contains(&ROOT), "B+Tree failed to create a root node");
 
         Ok(Self::new(schema, collator, dir))
     }
@@ -156,6 +157,14 @@ where
         FE: FileSave + Clone,
     {
         self.dir.sync().await
+    }
+
+    /// Explicitly make canonical storage durable without publishing pending versions.
+    pub async fn sync_all(&self) -> Result<(), io::Error>
+    where
+        FE: FileSave + Clone,
+    {
+        self.dir.sync_all().await
     }
 }
 
@@ -255,9 +264,8 @@ impl<S, C, FE> de::Visitor for BTreeVisitor<S, C, FE>
 where
     S: Schema + Send + Sync,
     C: Collate<Value = S::Value> + Clone + Send + Sync,
-    FE: AsType<Node<S::Value>> + Send + Sync,
+    FE: AsType<Node<S::Value>> + Send + Sync + FileLoad,
     S::Value: de::FromStream<Context = ()>,
-    Node<S::Value>: FileLoad,
 {
     type Value = BTreeLock<S, C, FE>;
 
@@ -281,9 +289,8 @@ impl<S, C, FE> de::FromStream for BTreeLock<S, C, FE>
 where
     S: Schema + Send + Sync,
     C: Collate<Value = S::Value> + Clone + Send + Sync,
-    FE: AsType<Node<S::Value>> + Send + Sync,
+    FE: AsType<Node<S::Value>> + Send + Sync + FileLoad,
     S::Value: de::FromStream<Context = ()>,
-    Node<S::Value>: FileLoad,
 {
     type Context = (S, C, DirLock<FE>);
 
@@ -333,9 +340,9 @@ impl<S, C, FE, G> BTree<S, C, G>
 where
     S: Schema,
     C: Collate<Value = S::Value>,
-    FE: AsType<Node<S::Value>> + Send + Sync,
+    FE: AsType<Node<S::Value>> + Send + Sync + FileLoad,
     G: DirDeref<Entry = FE>,
-    Node<S::Value>: FileLoad + fmt::Debug,
+    Node<S::Value>: fmt::Debug,
 {
     /// Return `true` if this B+Tree contains the given `key`.
     pub async fn contains(&self, key: &[S::Value]) -> Result<bool, io::Error> {
@@ -633,9 +640,9 @@ impl<S, C, FE, G> BTree<S, C, G>
 where
     S: Schema,
     C: Collate<Value = S::Value> + Clone + Send + Sync + 'static,
-    FE: AsType<Node<S::Value>> + Send + Sync + 'static,
+    FE: AsType<Node<S::Value>> + Send + Sync + 'static + FileLoad,
     G: DirDeref<Entry = FE> + Clone + Send + Sync + 'static,
-    Node<S::Value>: FileLoad + fmt::Debug,
+    Node<S::Value>: fmt::Debug,
 {
     /// Construct a [`Stream`] of all the keys in the given `range` of this B+Tree.
     pub async fn keys<BV>(self, range: Range<BV>) -> Result<Keys<S::Value>, io::Error>
@@ -802,9 +809,8 @@ where
     C: Collate<Value = V> + Clone + Send + Sync + 'static,
     V: Clone + PartialEq + fmt::Debug + Send + Sync + 'static,
     BV: Borrow<V> + Clone + Send + Sync + 'static,
-    FE: AsType<Node<V>> + Send + Sync + 'static,
+    FE: AsType<Node<V>> + Send + Sync + 'static + FileLoad,
     G: DirDeref<Entry = FE> + Clone + Send + Sync + 'static,
-    Node<V>: FileLoad,
 {
     #[cfg(feature = "logging")]
     log::debug!("reading BTree keys in forward order");
@@ -909,9 +915,8 @@ where
     C: Collate<Value = V> + Clone + Send + Sync + 'static,
     V: Clone + PartialEq + fmt::Debug + Send + Sync + 'static,
     BV: Borrow<V> + Clone + Send + Sync + 'static,
-    FE: AsType<Node<V>> + Send + Sync + 'static,
+    FE: AsType<Node<V>> + Send + Sync + 'static + FileLoad,
     G: DirDeref<Entry = FE> + Clone + Send + Sync + 'static,
-    Node<V>: FileLoad,
 {
     let file = dir.as_dir().get_file(&node_id).expect("node").clone();
     let fut = file.into_read().map_ok(move |node| {
@@ -1052,8 +1057,7 @@ impl<S, C, FE> BTree<S, C, DirWriteGuardOwned<FE>>
 where
     S: Schema + Send + Sync,
     C: Collate<Value = S::Value> + Send + Sync,
-    FE: AsType<Node<S::Value>> + Send + Sync,
-    Node<S::Value>: FileLoad,
+    FE: AsType<Node<S::Value>> + Send + Sync + FileLoad,
 {
     /// Delete the given `key` from this B+Tree.
     pub async fn delete<V>(&mut self, key: &[V]) -> Result<bool, io::Error>
@@ -1657,8 +1661,7 @@ impl<S, C, FE> BTree<S, C, DirWriteGuardOwned<FE>>
 where
     S: Schema + Send + Sync,
     C: Collate<Value = S::Value> + Clone + Send + Sync + 'static,
-    FE: AsType<Node<S::Value>> + Send + Sync + 'static,
-    Node<S::Value>: FileLoad,
+    FE: AsType<Node<S::Value>> + Send + Sync + 'static + FileLoad,
 {
     /// Merge the keys from the `other` B+Tree range into this one.
     ///
