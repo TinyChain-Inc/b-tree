@@ -1,4 +1,5 @@
 use std::borrow::Borrow;
+use std::collections::HashSet;
 use std::mem;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -250,6 +251,114 @@ where
             schema: self.schema.clone(),
             collator: self.collator.clone(),
             dir,
+        })
+    }
+}
+
+impl<S, C, FE> BTreeLock<S, C, FE>
+where
+    S: Schema + Send + Sync,
+    C: Collate<Value = S::Value> + Clone + Send + Sync,
+    FE: AsType<Node<S::Value>> + Send + Sync + FileLoad,
+{
+    /// Validate the complete selected tree before accepting storage.
+    pub async fn validate(&self) -> Result<(), io::Error> {
+        let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
+        let tree = self.read().await;
+        for (name, entry) in tree.dir.as_dir().iter() {
+            if name.parse::<Uuid>().is_err() || !entry.is_file() {
+                return Err(invalid("invalid BTree node entry"));
+            }
+        }
+        let mut seen = HashSet::new();
+        let mut pending = vec![(ROOT, None, None, 0)];
+        let mut leaf_depth = None;
+        while let Some((id, lower, upper, depth)) = pending.pop() {
+            if !seen.insert(id) {
+                return Err(invalid("repeated BTree node"));
+            }
+            let node = tree
+                .dir
+                .as_dir()
+                .read_file::<_, Node<S::Value>>(&id)
+                .await?;
+            let keys = match &*node {
+                Node::Leaf(keys) | Node::Index(keys, _) => keys,
+            };
+            if keys.len() > self.schema.order()
+                || keys.iter().any(|key| key.len() != self.schema.len())
+                || keys
+                    .iter()
+                    .any(|key| self.schema.validate_key(key.clone()).is_err())
+                || keys
+                    .windows(2)
+                    .any(|pair| !self.collator.cmp(&pair[0], &pair[1]).is_lt())
+                || lower.as_ref().is_some_and(|lower| {
+                    keys.first()
+                        .is_none_or(|first| !self.collator.cmp(first, lower).is_eq())
+                })
+                || upper.as_ref().is_some_and(|upper| {
+                    keys.last()
+                        .is_some_and(|last| !self.collator.cmp(last, upper).is_lt())
+                })
+            {
+                return Err(invalid("invalid BTree bounds"));
+            }
+            if let Node::Index(bounds, children) = &*node {
+                if bounds.is_empty() || bounds.len() != children.len() {
+                    return Err(invalid("invalid BTree children"));
+                }
+                for (i, child) in children.iter().enumerate() {
+                    pending.push((
+                        *child,
+                        Some(bounds[i].clone()),
+                        bounds.get(i + 1).cloned().or_else(|| upper.clone()),
+                        depth + 1,
+                    ));
+                }
+            } else if leaf_depth
+                .replace(depth)
+                .is_some_and(|prior| prior != depth)
+            {
+                return Err(invalid("unbalanced BTree"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy a caller-coordinated live tree into empty, unpublished delegated storage.
+    /// The source remains read-locked throughout copying; this does not validate or
+    /// repair it. Failure may leave an incomplete unpublished destination.
+    pub async fn copy_into(&self, target: DirLock<FE>) -> Result<Self, io::Error>
+    where
+        FE: Clone,
+    {
+        {
+            let mut target = target.write().await;
+            if !target.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "copy requires empty storage",
+                ));
+            }
+            // The empty target is exclusively owned construction storage. Check
+            // it before locking the source so invalid reverse copies cannot deadlock.
+            let source = self.dir.read().await;
+            for (name, entry) in source.iter() {
+                target
+                    .copy_file_from(
+                        name.clone(),
+                        entry.as_file().ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, "invalid BTree node entry")
+                        })?,
+                    )
+                    .await?;
+            }
+        }
+        Ok(Self {
+            schema: self.schema.clone(),
+            collator: self.collator.clone(),
+            dir: target,
         })
     }
 }
@@ -514,7 +623,11 @@ where
                     } else if range.contains_value(&bounds[l], &self.collator) {
                         break Some(stack_key(&bounds[l]));
                     } else {
-                        node = self.dir.as_dir().read_file(&children[l]).await?;
+                        node = self
+                            .dir
+                            .as_dir()
+                            .read_file(&children[l.saturating_sub(1)])
+                            .await?;
                     }
                 }
             }
