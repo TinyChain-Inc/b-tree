@@ -16,6 +16,119 @@ use b_tree::{BTreeLock, Node, Range, Schema};
 const BLOCK_SIZE: usize = 4_096;
 
 #[tokio::test]
+async fn in_place_splits_merges_copy_and_reopening() -> Result<(), io::Error> {
+    let path = setup_tmp_dir().await?;
+    let cache = Cache::<File>::new(1024 * 1024, None, 0, std::time::Duration::from_secs(3));
+    let dir = cache.clone().load(path.clone())?;
+    let tree = BTreeLock::create(
+        ExampleSchema::<i16>::new(1),
+        Collator::default(),
+        dir.clone(),
+    )?;
+    for key in 0..100 {
+        tree.write().await.insert(vec![key]).await?;
+    }
+    let files = dir.read().await.len();
+    for _ in 0..20 {
+        tree.write().await.insert(vec![99]).await?;
+    }
+    assert_eq!(dir.read().await.len(), files);
+    for key in 0..90 {
+        tree.write().await.delete(&[key]).await?;
+    }
+    for key in 100..150 {
+        tree.write().await.insert(vec![key]).await?;
+    }
+    tree.validate().await?;
+    tree.sync_all().await?;
+    drop(tree);
+    let reopened = Cache::<File>::new(1024 * 1024, None, 0, std::time::Duration::from_secs(3))
+        .load(path.clone())?;
+    let tree = BTreeLock::load(
+        ExampleSchema::<i16>::new(1),
+        Collator::default(),
+        reopened.clone(),
+    )?;
+    tree.validate().await?;
+    let keys: Vec<_> = tree
+        .read()
+        .await
+        .keys(Range::<i16>::default())
+        .await?
+        .map_ok(|key| key[0])
+        .try_collect()
+        .await?;
+    assert_eq!(keys, (90..150).collect::<Vec<_>>());
+    let copy_path = setup_tmp_dir().await?;
+    let copy_dir = cache.load(copy_path.clone())?;
+    let copy = tree.copy_into(copy_dir.clone()).await?;
+    assert!(matches!(
+        tree.copy_into(copy_dir.clone()).await,
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists
+    ));
+    {
+        let source = reopened.read().await;
+        let target = copy_dir.read().await;
+        assert_eq!(source.len(), target.len());
+        for name in source.names() {
+            let source = source.read_file::<_, Node<Vec<Vec<i16>>>>(name).await?;
+            let target = target.read_file::<_, Node<Vec<Vec<i16>>>>(name).await?;
+            match (&*source, &*target) {
+                (Node::Leaf(left), Node::Leaf(right)) => assert_eq!(left, right),
+                (Node::Index(left, left_children), Node::Index(right, right_children)) => {
+                    assert_eq!(left, right);
+                    assert_eq!(left_children, right_children);
+                }
+                _ => panic!("copy changed the node kind"),
+            }
+        }
+    }
+    tree.write().await.truncate().await?;
+    assert_eq!(copy.read().await.count(&Range::<i16>::default()).await?, 60);
+    let root = uuid::Uuid::nil();
+    {
+        let contents = copy_dir.write().await;
+        *contents.write_file::<_, Node<Vec<Vec<i16>>>>(&root).await? =
+            Node::Index(vec![vec![90]], vec![root]);
+    }
+    assert!(copy.validate().await.is_err());
+    reopened.write().await.create_dir("unexpected".into())?;
+    copy_dir.write().await.truncate().await;
+    assert!(matches!(
+        tree.copy_into(copy_dir.clone()).await,
+        Err(err) if err.kind() == io::ErrorKind::InvalidData
+    ));
+    fs::remove_dir_all(path).await?;
+    fs::remove_dir_all(copy_path).await
+}
+
+#[tokio::test]
+async fn lookup_between_index_bounds_uses_the_preceding_child() -> Result<(), io::Error> {
+    let path = setup_tmp_dir().await?;
+    let cache = Cache::<File>::new(1024 * 1024, None, 0, std::time::Duration::from_secs(3));
+    let tree = BTreeLock::create(
+        ExampleSchema::<i16>::new(1),
+        Collator::<i16>::default(),
+        cache.load(path.clone())?,
+    )?;
+    for key in (0..100).step_by(2) {
+        tree.write().await.insert(vec![key]).await?;
+    }
+    {
+        let view = tree.read().await;
+        for key in 0..100 {
+            let first = view
+                .first(Range::from(
+                    vec![key].into_iter().collect::<b_tree::Key<i16>>(),
+                ))
+                .await?;
+            assert_eq!(first.map(|row| row[0]), (key % 2 == 0).then_some(key));
+        }
+    }
+    fs::remove_dir_all(path).await
+}
+
+#[tokio::test]
 async fn load_requires_existing_root() -> Result<(), io::Error> {
     let path = setup_tmp_dir().await?;
     let cache = Cache::<File>::new(BLOCK_SIZE, None, 0, std::time::Duration::from_secs(3));
