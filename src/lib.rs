@@ -103,9 +103,10 @@ pub trait Schema: Eq + fmt::Debug {
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// The type of value stored in a B+Tree's keys
-    type Value: Default + Clone + Eq + Send + Sync + fmt::Debug + 'static;
+    type Value: Default + Clone + Eq + get_size::GetSize + Send + Sync + fmt::Debug + 'static;
 
-    /// Get the maximum size in bytes of a leaf node in a B+Tree with this [`Schema`].
+    /// Estimate leaf bytes for storage allocation; `order` bounds key count.
+    /// Actual encoded and retained sizes are accounted for by the file adapter.
     fn block_size(&self) -> usize;
 
     /// Get the number of values in each key.

@@ -11,8 +11,6 @@ use uuid::Uuid;
 use super::Collator;
 use super::range::Range;
 
-const UUID_SIZE: usize = 16;
-
 /// An ordered set of keys in a [`Node`].
 pub trait Block<V> {
     type Key;
@@ -147,10 +145,12 @@ impl<N> Node<N> {
 }
 
 impl<N: GetSize> GetSize for Node<N> {
-    fn get_size(&self) -> usize {
+    fn get_heap_size(&self) -> usize {
         match self {
-            Self::Index(keys, children) => keys.get_size() + (children.len() * UUID_SIZE),
-            Self::Leaf(leaf) => leaf.get_size(),
+            Self::Index(keys, children) => {
+                keys.get_heap_size() + children.capacity() * std::mem::size_of::<Uuid>()
+            }
+            Self::Leaf(leaf) => leaf.get_heap_size(),
         }
     }
 }
