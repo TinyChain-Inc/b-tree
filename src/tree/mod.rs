@@ -16,6 +16,7 @@ use futures::TryFutureExt;
 use futures::future::{self, Future, FutureExt};
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use futures::try_join;
+use get_size::GetSize;
 use safecast::AsType;
 use smallvec::SmallVec;
 use uuid::Uuid;
@@ -119,12 +120,14 @@ where
         }
     }
 
-    /// Create a new [`BTreeLock`] in `dir` with the given `collator`.
-    pub fn create(schema: S, collator: C, dir: DirLock<FE>) -> Result<Self, io::Error> {
+    /// Create a new [`BTreeLock`], awaiting admission of its root in `dir`.
+    pub async fn create(schema: S, collator: C, dir: DirLock<FE>) -> Result<Self, io::Error> {
         let mut nodes = dir.try_write_owned()?;
 
         if nodes.is_empty() {
-            nodes.create_empty_file::<Node<S::Value>>(ROOT.to_string(), Node::Leaf(vec![]))?;
+            nodes
+                .create_empty_file::<Node<S::Value>>(ROOT.to_string(), Node::Leaf(vec![]))
+                .await?;
 
             debug_assert!(nodes.contains(&ROOT), "B+Tree failed to create a root node");
 
@@ -408,7 +411,9 @@ where
         decoder: &mut D,
     ) -> Result<Self, D::Error> {
         let (schema, collator, dir) = context;
-        let btree = BTreeLock::create(schema, collator, dir).map_err(de::Error::custom)?;
+        let btree = BTreeLock::create(schema, collator, dir)
+            .await
+            .map_err(de::Error::custom)?;
         decoder.decode_seq(BTreeVisitor { btree }).await
     }
 }
@@ -1120,6 +1125,47 @@ where
     Box::pin(fut)
 }
 
+fn size_overflow() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, "BTree retained size overflow")
+}
+
+fn rows_heap<T: GetSize>(rows: &[Vec<T>]) -> Result<usize, io::Error> {
+    rows.iter().try_fold(0usize, |size, row| {
+        size.checked_add(row.get_heap_size())
+            .ok_or_else(size_overflow)
+    })
+}
+
+fn maximum_row_heap<T: GetSize>(node: &Node<T>) -> usize {
+    let rows = match node {
+        Node::Leaf(rows) | Node::Index(rows, _) => rows,
+    };
+
+    rows.iter().map(GetSize::get_heap_size).max().unwrap_or(0)
+}
+
+fn vec_growth<T>(values: &Vec<T>, additional: usize) -> Result<usize, io::Error> {
+    let required = values
+        .len()
+        .checked_add(additional)
+        .ok_or_else(size_overflow)?;
+
+    if required <= values.capacity() {
+        return Ok(0);
+    }
+
+    let capacity = values
+        .capacity()
+        .checked_mul(2)
+        .ok_or_else(size_overflow)?
+        .max(required)
+        .max(4);
+
+    (capacity - values.capacity())
+        .checked_mul(mem::size_of::<T>())
+        .ok_or_else(size_overflow)
+}
+
 enum MergeIndexLeft<V> {
     Borrow(Vec<V>),
     Merge(Vec<V>),
@@ -1140,7 +1186,7 @@ enum MergeLeafRight {
     Merge,
 }
 
-enum Delete<FE, V> {
+enum Delete<FE: GetSize, V> {
     None,
     Left(Vec<V>),
     Right,
@@ -1172,13 +1218,90 @@ where
     C: Collate<Value = S::Value> + Send + Sync,
     FE: AsType<Node<S::Value>> + Send + Sync + FileLoad,
 {
+    async fn write_node(
+        &self,
+        id: &Uuid,
+    ) -> Result<FileWriteGuardOwned<FE, Node<S::Value>>, io::Error> {
+        self.dir.write_file_owned(id, 0).await
+    }
+
+    async fn reserve_node(
+        &self,
+        node: &mut FileWriteGuardOwned<FE, Node<S::Value>>,
+        rows: usize,
+        row_heap: usize,
+        children: usize,
+    ) -> Result<(), io::Error> {
+        let keys = match &**node {
+            Node::Leaf(keys) | Node::Index(keys, _) => keys,
+        };
+        let growth = vec_growth(keys, rows)?;
+        let child_growth = match &**node {
+            Node::Index(_, ids) => vec_growth(ids, children)?,
+            Node::Leaf(_) => children
+                .checked_mul(mem::size_of::<Uuid>())
+                .ok_or_else(size_overflow)?,
+        };
+        let bound = mem::size_of::<FE>()
+            .checked_add((**node).get_size())
+            .and_then(|size| size.checked_add(growth))
+            .and_then(|size| size.checked_add(row_heap))
+            .and_then(|size| size.checked_add(child_growth))
+            .ok_or_else(size_overflow)?;
+
+        node.reserve(bound).await
+    }
+
+    // Admit transfers before lending payloads to the existing merge helpers.
+    async fn reserve_merge(
+        &self,
+        parent: &mut FileWriteGuardOwned<FE, Node<S::Value>>,
+        child: &mut FileWriteGuardOwned<FE, Node<S::Value>>,
+        i: usize,
+    ) -> Result<(), io::Error> {
+        let Node::Index(_, children) = &**parent else {
+            unreachable!("index")
+        };
+        let mut sibling = children[if i == 0 { 1 } else { i - 1 }];
+        let mut row_heap = maximum_row_heap(child);
+
+        loop {
+            let (maximum, next) = {
+                let node = self.dir.read_file::<_, Node<S::Value>>(&sibling).await?;
+                let next = match &*node {
+                    Node::Index(_, children) if child.is_leaf() && i == 0 => {
+                        children.first().copied()
+                    }
+                    _ => None,
+                };
+                (maximum_row_heap(&node), next)
+            };
+            row_heap = row_heap.max(maximum);
+            if let Some(next) = next {
+                sibling = next;
+            } else {
+                break;
+            }
+        }
+
+        self.reserve_node(
+            parent,
+            0,
+            row_heap.checked_mul(2).ok_or_else(size_overflow)?,
+            0,
+        )
+        .await?;
+        self.reserve_node(child, 1, row_heap, usize::from(!child.is_leaf()))
+            .await
+    }
+
     /// Delete the given `key` from this B+Tree.
     pub async fn delete<V>(&mut self, key: &[V]) -> Result<bool, io::Error>
     where
         V: Borrow<S::Value> + Send + Sync,
     {
         debug_assert!(self.dir.contains(&ROOT), "B+Tree is missing its root node");
-        let mut root = self.dir.write_file_owned(&ROOT).await?;
+        let mut root = self.write_node(&ROOT).await?;
 
         let new_root = match &mut *root {
             Node::Leaf(keys) => {
@@ -1196,24 +1319,42 @@ where
                     i => i - 1,
                 };
 
-                let node = self.dir.write_file_owned(&children[i]).await?;
+                let node = self.write_node(&children[i]).await?;
                 match self.delete_inner(node, key).await? {
                     Delete::None => return Ok(false),
                     Delete::Right => return Ok(true),
                     Delete::Left(bound) => {
+                        self.reserve_node(&mut root, 0, bound.get_heap_size(), 0)
+                            .await?;
+                        let Node::Index(bounds, _) = &mut *root else {
+                            unreachable!("index")
+                        };
                         bounds[i] = bound;
                         return Ok(true);
                     }
-                    Delete::Underflow(mut node) => match &mut *node {
-                        Node::Leaf(new_keys) => {
-                            self.merge_leaf(new_keys, i, bounds, children).await?
+                    Delete::Underflow(mut node) => {
+                        self.reserve_merge(&mut root, &mut node, i).await?;
+                        let Node::Index(bounds, children) = &mut *root else {
+                            unreachable!("index")
+                        };
+                        let retired = match &mut *node {
+                            Node::Leaf(new_keys) => {
+                                self.merge_leaf(new_keys, i, bounds, children).await?
+                            }
+                            Node::Index(new_bounds, new_children) => {
+                                self.merge_index(new_bounds, new_children, i, bounds, children)
+                                    .await?
+                            }
+                        };
+                        drop(node);
+                        if let Some(id) = retired {
+                            self.dir.delete(&id).await;
                         }
-                        Node::Index(new_bounds, new_children) => {
-                            self.merge_index(new_bounds, new_children, i, bounds, children)
-                                .await?
-                        }
-                    },
+                    }
                 }
+                let Node::Index(bounds, children) = &mut *root else {
+                    unreachable!("index")
+                };
 
                 if children.len() == 1 {
                     bounds.pop();
@@ -1226,7 +1367,7 @@ where
 
         if let Some(only_child) = new_root {
             let new_root = {
-                let mut child = self.dir.write_file(&only_child).await?;
+                let mut child = self.write_node(&only_child).await?;
                 match &mut *child {
                     Node::Leaf(keys) => Node::Leaf(mem::take(keys)),
                     Node::Index(bounds, children) => {
@@ -1235,6 +1376,12 @@ where
                 }
             };
 
+            root.reserve(
+                mem::size_of::<FE>()
+                    .checked_add(new_root.get_size())
+                    .ok_or_else(size_overflow)?,
+            )
+            .await?;
             self.dir.delete(&only_child).await;
 
             *root = new_root;
@@ -1276,11 +1423,16 @@ where
                         i => i - 1,
                     };
 
-                    let child = self.dir.write_file_owned(&children[i]).await?;
+                    let child = self.write_node(&children[i]).await?;
                     match self.delete_inner(child, key).await? {
                         Delete::None => return Ok(Delete::None),
                         Delete::Right => return Ok(Delete::Right),
                         Delete::Left(bound) => {
+                            self.reserve_node(&mut node, 0, bound.get_heap_size(), 0)
+                                .await?;
+                            let Node::Index(bounds, _) = &mut *node else {
+                                unreachable!("index")
+                            };
                             bounds[i] = bound;
 
                             return if i == 0 {
@@ -1289,16 +1441,29 @@ where
                                 Ok(Delete::Right)
                             };
                         }
-                        Delete::Underflow(mut node) => match &mut *node {
-                            Node::Leaf(new_keys) => {
-                                self.merge_leaf(new_keys, i, bounds, children).await?
+                        Delete::Underflow(mut child) => {
+                            self.reserve_merge(&mut node, &mut child, i).await?;
+                            let Node::Index(bounds, children) = &mut *node else {
+                                unreachable!("index")
+                            };
+                            let retired = match &mut *child {
+                                Node::Leaf(new_keys) => {
+                                    self.merge_leaf(new_keys, i, bounds, children).await?
+                                }
+                                Node::Index(new_bounds, new_children) => {
+                                    self.merge_index(new_bounds, new_children, i, bounds, children)
+                                        .await?
+                                }
+                            };
+                            drop(child);
+                            if let Some(id) = retired {
+                                self.dir.delete(&id).await;
                             }
-                            Node::Index(new_bounds, new_children) => {
-                                self.merge_index(new_bounds, new_children, i, bounds, children)
-                                    .await?
-                            }
-                        },
+                        }
                     }
+                    let Node::Index(bounds, children) = &mut *node else {
+                        unreachable!("index")
+                    };
 
                     if children.len() > (self.schema.order() / 2) {
                         if i == 0 {
@@ -1321,8 +1486,9 @@ where
         i: usize,
         bounds: &'a mut Vec<Vec<S::Value>>,
         children: &'a mut Vec<Uuid>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), io::Error>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Uuid>, io::Error>> + Send + 'a>> {
         Box::pin(async move {
+            let mut retired = None;
             if i == 0 {
                 match self
                     .merge_index_left(new_bounds, new_children, &children[i + 1])
@@ -1333,7 +1499,7 @@ where
                         bounds[i + 1] = bound;
                     }
                     MergeIndexLeft::Merge(bound) => {
-                        self.dir.delete(&children[0]).await;
+                        retired = Some(children[0]);
                         children.remove(0);
                         bounds.remove(0);
                         bounds[0] = bound;
@@ -1348,14 +1514,14 @@ where
                         bounds[i] = new_bounds[0].to_vec();
                     }
                     MergeIndexRight::Merge => {
-                        self.dir.delete(&children[i]).await;
+                        retired = Some(children[i]);
                         children.remove(i);
                         bounds.remove(i);
                     }
                 }
             }
 
-            Ok(())
+            Ok(retired)
         })
     }
 
@@ -1366,7 +1532,14 @@ where
         node_id: &'a Uuid,
     ) -> Pin<Box<dyn Future<Output = ResultMergeIndex<S::Value>> + Send + 'a>> {
         Box::pin(async move {
-            let mut node = self.dir.write_file(node_id).await?;
+            let mut node = self.write_node(node_id).await?;
+            self.reserve_node(
+                &mut node,
+                left_bounds.len(),
+                rows_heap(left_bounds)?,
+                left_children.len(),
+            )
+            .await?;
 
             match &mut *node {
                 Node::Leaf(_right_keys) => unreachable!("merge a leaf node with an index node"),
@@ -1403,7 +1576,14 @@ where
         node_id: &'a Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<MergeIndexRight, io::Error>> + Send + 'a>> {
         Box::pin(async move {
-            let mut node = self.dir.write_file(node_id).await?;
+            let mut node = self.write_node(node_id).await?;
+            self.reserve_node(
+                &mut node,
+                right_bounds.len(),
+                rows_heap(right_bounds)?,
+                right_children.len(),
+            )
+            .await?;
 
             match &mut *node {
                 Node::Leaf(_left_keys) => unreachable!("merge a leaf node with an index node"),
@@ -1432,8 +1612,9 @@ where
         i: usize,
         bounds: &'a mut Vec<Vec<S::Value>>,
         children: &'a mut Vec<Uuid>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), io::Error>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Uuid>, io::Error>> + Send + 'a>> {
         Box::pin(async move {
+            let mut retired = None;
             if i == 0 {
                 match self.merge_leaf_left(new_keys, &children[i + 1]).await? {
                     MergeLeafLeft::Borrow(bound) => {
@@ -1441,7 +1622,7 @@ where
                         bounds[i + 1] = bound;
                     }
                     MergeLeafLeft::Merge(bound) => {
-                        self.dir.delete(&children[0]).await;
+                        retired = Some(children[0]);
                         children.remove(0);
                         bounds.remove(0);
                         bounds[0] = bound;
@@ -1453,14 +1634,14 @@ where
                         bounds[i] = new_keys[0].to_vec();
                     }
                     MergeLeafRight::Merge => {
-                        self.dir.delete(&children[i]).await;
+                        retired = Some(children[i]);
                         children.remove(i);
                         bounds.remove(i);
                     }
                 }
             }
 
-            Ok(())
+            Ok(retired)
         })
     }
 
@@ -1470,7 +1651,9 @@ where
         node_id: &'a Uuid,
     ) -> Pin<Box<dyn Future<Output = ResultMergeLeaf<S::Value>> + Send + 'a>> {
         Box::pin(async move {
-            let mut node = self.dir.write_file(node_id).await?;
+            let mut node = self.write_node(node_id).await?;
+            self.reserve_node(&mut node, left_keys.len(), rows_heap(left_keys)?, 0)
+                .await?;
 
             match &mut *node {
                 Node::Leaf(right_keys) => {
@@ -1486,8 +1669,17 @@ where
                         Ok(MergeLeafLeft::Merge(right_keys[0].to_vec()))
                     }
                 }
-                Node::Index(bounds, children) => {
-                    match self.merge_leaf_left(left_keys, &children[0]).await? {
+                Node::Index(_, children) => {
+                    let result = self.merge_leaf_left(left_keys, &children[0]).await?;
+                    let bound = match &result {
+                        MergeLeafLeft::Borrow(bound) | MergeLeafLeft::Merge(bound) => bound,
+                    };
+                    self.reserve_node(&mut node, 0, bound.get_heap_size(), 0)
+                        .await?;
+                    let Node::Index(bounds, _) = &mut *node else {
+                        unreachable!("index")
+                    };
+                    match result {
                         MergeLeafLeft::Borrow(left) => {
                             bounds[0] = left.to_vec();
                             Ok(MergeLeafLeft::Borrow(left))
@@ -1508,7 +1700,9 @@ where
         node_id: &'a Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<MergeLeafRight, io::Error>> + Send + 'a>> {
         Box::pin(async move {
-            let mut node = self.dir.write_file(node_id).await?;
+            let mut node = self.write_node(node_id).await?;
+            self.reserve_node(&mut node, right_keys.len(), rows_heap(right_keys)?, 0)
+                .await?;
 
             match &mut *node {
                 Node::Leaf(left_keys) => {
@@ -1533,13 +1727,141 @@ where
         self.insert_root(key).await
     }
 
+    /// Append an ordered stream of keys at or beyond the current maximum.
+    /// Equal keys are ignored, as with `insert`. Returns the number inserted.
+    /// Errors and cancellation retain the successfully inserted prefix.
+    /// Only a rightmost leaf identifier and one previous key are retained;
+    /// splits and ancestor updates use the ordinary insertion implementation.
+    pub fn insert_sorted<'a, K>(
+        &'a mut self,
+        keys: K,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, io::Error>> + Send + 'a>>
+    where
+        K: Stream<Item = Result<Vec<S::Value>, io::Error>> + Send + 'a,
+    {
+        Box::pin(async move {
+            futures::pin_mut!(keys);
+            let mut leaf_id = self.rightmost_leaf().await?;
+            let mut previous = {
+                let leaf = self.dir.read_file(&leaf_id).await?;
+                match &*leaf {
+                    Node::Leaf(rows) => rows.last().cloned(),
+                    Node::Index(..) => unreachable!("rightmost leaf"),
+                }
+            };
+            let mut inserted = 0;
+
+            while let Some(key) = keys.try_next().await? {
+                let key = validate_key(&*self.schema, key)?;
+                if let Some(previous) = &previous {
+                    if self.collator.cmp_slices(&key, previous).is_lt() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "ordered insertion precedes the current maximum",
+                        ));
+                    }
+                    if previous == &key {
+                        continue;
+                    }
+                }
+                previous = Some(key.clone());
+
+                {
+                    let mut leaf = self.write_node(&leaf_id).await?;
+                    let Node::Leaf(rows) = &*leaf else {
+                        unreachable!("rightmost leaf")
+                    };
+
+                    // Leave splitting and empty-root initialization to insert_root.
+                    // Appending to a nonempty leaf never changes an ancestor bound.
+                    let limit = if leaf_id == ROOT {
+                        self.schema.order()
+                    } else {
+                        self.schema.order() - 1
+                    };
+
+                    if !rows.is_empty() && rows.len() < limit {
+                        self.reserve_node(&mut leaf, 1, key.get_heap_size(), 0)
+                            .await?;
+                        let Node::Leaf(rows) = &mut *leaf else {
+                            unreachable!("rightmost leaf")
+                        };
+                        rows.push(key);
+                        inserted += 1;
+                        continue;
+                    }
+                }
+
+                inserted += u64::from(self.insert_root(key).await?);
+                leaf_id = self.rightmost_leaf().await?;
+            }
+
+            Ok(inserted)
+        })
+    }
+
+    async fn rightmost_leaf(&self) -> Result<Uuid, io::Error> {
+        let mut id = ROOT;
+
+        loop {
+            let node = self.dir.read_file::<_, Node<S::Value>>(&id).await?;
+            match &*node {
+                Node::Leaf(_) => return Ok(id),
+                Node::Index(_, children) => {
+                    id = *children.last().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "empty BTree index")
+                    })?;
+                }
+            }
+        }
+    }
+
+    async fn create_node(
+        &mut self,
+        node: Node<S::Value>,
+    ) -> Result<(Uuid, freqfs::FileLock<FE>), io::Error> {
+        let bound = mem::size_of::<FE>()
+            .checked_add(node.get_size())
+            .ok_or_else(size_overflow)?;
+
+        self.dir.create_file_unique(node, bound).await
+    }
+
+    async fn reserve_insert(
+        &self,
+        node: &mut FileWriteGuardOwned<FE, Node<S::Value>>,
+        result: &Insert<S::Value>,
+    ) -> Result<(), io::Error> {
+        match result {
+            Insert::None | Insert::Right => Ok(()),
+            Insert::Left(key) => {
+                self.reserve_node(node, 0, Vec::<S::Value>::get_heap_size(key), 0)
+                    .await
+            }
+            Insert::Overflow(key, _) => {
+                self.reserve_node(node, 1, Vec::<S::Value>::get_heap_size(key), 1)
+                    .await
+            }
+            Insert::OverflowLeft(left, middle, _) => {
+                self.reserve_node(
+                    node,
+                    1,
+                    Vec::<S::Value>::get_heap_size(left)
+                        .checked_add(Vec::<S::Value>::get_heap_size(middle))
+                        .ok_or_else(size_overflow)?,
+                    1,
+                )
+                .await
+            }
+        }
+    }
+
     async fn insert_root(&mut self, key: Vec<S::Value>) -> Result<bool, io::Error> {
         let order = self.schema.order();
 
         debug_assert!(self.dir.contains(&ROOT), "B+Tree is missing its root node");
-        let mut root = self.dir.write_file_owned(&ROOT).await?;
-
-        let new_root = match &mut *root {
+        let mut root = self.write_node(&ROOT).await?;
+        let new_root = match &*root {
             Node::Leaf(keys) => {
                 let i = keys.bisect_left(&key, &self.collator);
 
@@ -1548,23 +1870,27 @@ where
                     return Ok(false);
                 }
 
+                self.reserve_node(&mut root, 1, key.get_heap_size(), 0)
+                    .await?;
+                let Node::Leaf(keys) = &mut *root else {
+                    unreachable!("leaf")
+                };
                 keys.insert(i, key);
 
                 if keys.len() > order {
                     let mid = div_ceil(order, 2);
-                    let size = self.schema.block_size() / 2;
 
                     let right: Vec<_> = keys.drain(mid..).collect();
                     debug_assert!(right.len() >= mid);
 
                     let right_key = right[0].clone();
-                    let (right, _) = self.dir.create_file_unique(Node::Leaf(right), size).await?;
+                    let (right, _) = self.create_node(Node::Leaf(right)).await?;
 
                     let left: Vec<_> = mem::take(keys);
                     debug_assert!(left.len() >= mid);
 
                     let left_key = left[0].clone();
-                    let (left, _) = self.dir.create_file_unique(Node::Leaf(left), size).await?;
+                    let (left, _) = self.create_node(Node::Leaf(left)).await?;
 
                     Some(Node::Index(vec![left_key, right_key], vec![left, right]))
                 } else {
@@ -1574,13 +1900,18 @@ where
             Node::Index(bounds, children) => {
                 debug_assert_eq!(bounds.len(), children.len());
 
-                let i = match bounds.bisect_left(&key, &self.collator) {
+                // Equality belongs to this child, whose first key is the bound.
+                let i = match bounds.bisect_right(&key, &self.collator) {
                     0 => 0,
                     i => i - 1,
                 };
 
-                let mut child = self.dir.write_file_owned(&children[i]).await?;
+                let mut child = self.write_node(&children[i]).await?;
                 let result = self.insert_inner(&mut child, key).await?;
+                self.reserve_insert(&mut root, &result).await?;
+                let Node::Index(bounds, children) = &mut *root else {
+                    unreachable!("index")
+                };
 
                 match result {
                     Insert::None => return Ok(false),
@@ -1603,21 +1934,18 @@ where
                 debug_assert_eq!(bounds.len(), children.len());
 
                 if children.len() > order {
-                    let size = self.schema.block_size() / 2;
                     let right_bounds: Vec<_> = bounds.drain(div_ceil(order, 2)..).collect();
                     let right_children: Vec<_> = children.drain(div_ceil(order, 2)..).collect();
                     let right_bound = right_bounds[0].clone();
                     let (right_node_id, _) = self
-                        .dir
-                        .create_file_unique(Node::Index(right_bounds, right_children), size)
+                        .create_node(Node::Index(right_bounds, right_children))
                         .await?;
 
                     let left_bounds: Vec<_> = mem::take(bounds);
                     let left_children: Vec<_> = mem::take(children);
                     let left_bound = left_bounds[0].clone();
                     let (left_node_id, _) = self
-                        .dir
-                        .create_file_unique(Node::Index(left_bounds, left_children), size)
+                        .create_node(Node::Index(left_bounds, left_children))
                         .await?;
 
                     Some(Node::Index(
@@ -1631,6 +1959,12 @@ where
         };
 
         if let Some(new_root) = new_root {
+            root.reserve(
+                mem::size_of::<FE>()
+                    .checked_add(new_root.get_size())
+                    .ok_or_else(size_overflow)?,
+            )
+            .await?;
             *root = new_root;
         }
 
@@ -1639,13 +1973,12 @@ where
 
     fn insert_inner<'a>(
         &'a mut self,
-        node: &'a mut Node<S::Value>,
+        node: &'a mut FileWriteGuardOwned<FE, Node<S::Value>>,
         key: Vec<S::Value>,
     ) -> Pin<Box<dyn Future<Output = ResultInsert<S::Value>> + Send + 'a>> {
         Box::pin(async move {
             let order = self.schema.order();
-
-            match node {
+            match &**node {
                 Node::Leaf(keys) => {
                     let i = keys.bisect_left(&key, &self.collator);
 
@@ -1654,12 +1987,15 @@ where
                         return Ok(Insert::None);
                     }
 
+                    self.reserve_node(node, 1, key.get_heap_size(), 0).await?;
+                    let Node::Leaf(keys) = &mut **node else {
+                        unreachable!("leaf")
+                    };
                     keys.insert(i, key);
 
                     let mid = order / 2;
 
                     if keys.len() >= order {
-                        let size = self.schema.block_size() / 2;
                         let new_leaf: Vec<_> = keys.drain(mid..).collect();
 
                         debug_assert!(new_leaf.len() >= mid);
@@ -1667,7 +2003,7 @@ where
 
                         let middle_key = new_leaf[0].to_vec();
                         let node = Node::Leaf(new_leaf);
-                        let (new_node_id, _) = self.dir.create_file_unique(node, size).await?;
+                        let (new_node_id, _) = self.create_node(node).await?;
 
                         if i == 0 {
                             Ok(Insert::OverflowLeft(
@@ -1690,16 +2026,21 @@ where
                 }
                 Node::Index(bounds, children) => {
                     debug_assert_eq!(bounds.len(), children.len());
-                    let size = self.schema.block_size() >> 1;
 
-                    let i = match bounds.bisect_left(&key, &self.collator) {
+                    // Equality belongs to this child, whose first key is the bound.
+                    let i = match bounds.bisect_right(&key, &self.collator) {
                         0 => 0,
                         i => i - 1,
                     };
 
-                    let mut child = self.dir.write_file_owned(&children[i]).await?;
+                    let mut child = self.write_node(&children[i]).await?;
 
-                    let overflow_left = match self.insert_inner(&mut child, key).await? {
+                    let result = self.insert_inner(&mut child, key).await?;
+                    self.reserve_insert(node, &result).await?;
+                    let Node::Index(bounds, children) = &mut **node else {
+                        unreachable!("index")
+                    };
+                    let overflow_left = match result {
                         Insert::None => return Ok(Insert::None),
                         Insert::Right => return Ok(Insert::Right),
                         Insert::Left(key) => {
@@ -1733,7 +2074,7 @@ where
 
                         let left_bound = new_bounds[0].to_vec();
                         let node = Node::Index(new_bounds, new_children);
-                        let (node_id, _) = self.dir.create_file_unique(node, size).await?;
+                        let (node_id, _) = self.create_node(node).await?;
 
                         if overflow_left {
                             Ok(Insert::OverflowLeft(
@@ -1759,7 +2100,8 @@ where
         self.dir.truncate().await;
 
         self.dir
-            .create_empty_file(ROOT.to_string(), Node::Leaf(vec![]))?;
+            .create_empty_file(ROOT.to_string(), Node::Leaf(vec![]))
+            .await?;
 
         debug_assert!(
             self.dir.contains(&ROOT),

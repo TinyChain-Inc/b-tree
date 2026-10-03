@@ -1,9 +1,11 @@
 # b-tree
+
 A persistent B+ tree using freqfs
 
-Use `BTreeLock::create` for empty delegated storage and `BTreeLock::load` for an
-existing tree. Loading never creates a missing root. Synchronize a newly created
-tree before relying on reopening it after a restart.
+Use async `BTreeLock::create` for empty delegated storage, awaiting cache admission
+for its root, and `BTreeLock::load` for an existing tree. Loading never creates a
+missing root. Synchronize a newly created tree before relying on reopening it
+after a restart.
 
 Run `cargo test --all-targets --all-features` to include the strict-load example test.
 
@@ -13,6 +15,8 @@ Mutations update individual blocks in place and remove obsolete nodes. `sync()`
 is buffered writeback; `sync_all()` explicitly synchronizes backing storage.
 Neither makes multi-block operations atomic across a crash. Durable transaction
 history and interrupted-materialization recovery belong to the caller.
+`truncate()` removes old nodes before admitting the replacement root; failure or
+cancellation may therefore leave incomplete storage which loading rejects.
 
 `validate()` checks reachable structure, ordering and node identities. `copy_into()`
 copies reachable nodes into empty delegated storage; callers coordinate source
@@ -28,3 +32,8 @@ reinterpret bytes as whichever type a reader requests.
 The `stream` feature supplies destream implementations without selecting a byte
 codec. Applications implement `FileLoad`/`FileSave` for their file entry type
 using their chosen codec. The examples choose TBON explicitly.
+
+`BTreeWriteGuard::insert_sorted` consumes a fallible ordered key stream beginning
+at or beyond the current maximum. It ignores existing equal keys, returns the
+number inserted, and retains bounded traversal state. Errors or cancellation may
+leave an inserted prefix; callers own unpublished construction and recovery.
