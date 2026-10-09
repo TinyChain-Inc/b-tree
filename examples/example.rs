@@ -42,6 +42,80 @@ async fn root_creation_reclaims_cached_nodes() -> io::Result<()> {
 }
 
 #[tokio::test]
+async fn missing_root_returns_errors_without_repair() -> io::Result<()> {
+    let path = setup_tmp_dir().await?;
+    let cache = Cache::<File>::new(BLOCK_SIZE, None, 0, std::time::Duration::from_secs(1));
+    let dir = cache.load(path.clone())?;
+    let tree = BTreeLock::create(
+        ExampleSchema::<i16>::new(1),
+        Collator::default(),
+        dir.clone(),
+    )
+    .await?;
+    tree.write().await.insert(vec![1]).await?;
+    assert!(dir.write().await.delete(&uuid::Uuid::nil()).await);
+
+    for operation in [
+        "contains",
+        "count",
+        "first",
+        "last",
+        "is_empty",
+        "keys",
+        "keys_rev",
+        "groups",
+        "groups_rev",
+        "insert",
+        "insert_sorted",
+        "delete",
+        "validate",
+    ] {
+        let range = Range::<i16>::default();
+        let result = match operation {
+            "contains" => tree.read().await.contains(&[1]).await.map(|_| ()),
+            "count" => tree.read().await.count(&range).await.map(|_| ()),
+            "first" => tree.read().await.first(range).await.map(|_| ()),
+            "last" => tree.read().await.last(range).await.map(|_| ()),
+            "is_empty" => tree.read().await.is_empty(range).await.map(|_| ()),
+            "keys" | "keys_rev" | "groups" | "groups_rev" => {
+                let reader = tree.read().await;
+                let stream = match operation {
+                    "keys" => reader.keys(range).await,
+                    "keys_rev" => reader.keys_rev(range).await,
+                    "groups" => reader.groups(range, 1, false).await,
+                    "groups_rev" => reader.groups(range, 1, true).await,
+                    _ => unreachable!(),
+                };
+                match stream {
+                    Ok(mut stream) => stream.try_next().await.map(|_| ()),
+                    Err(error) => Err(error),
+                }
+            }
+            "insert" => tree.write().await.insert(vec![2]).await.map(|_| ()),
+            "insert_sorted" => tree
+                .write()
+                .await
+                .insert_sorted(futures::stream::iter([Ok(vec![2])]))
+                .await
+                .map(|_| ()),
+            "delete" => tree.write().await.delete(&[1]).await.map(|_| ()),
+            "validate" => tree.validate().await,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            result.expect_err(operation).kind(),
+            io::ErrorKind::NotFound,
+            "{operation}",
+        );
+        assert!(dir.read().await.is_empty(), "{operation} repaired storage");
+    }
+
+    drop(tree);
+    drop(dir);
+    fs::remove_dir_all(path).await
+}
+
+#[tokio::test]
 async fn interrupted_truncate_does_not_publish_a_missing_root() -> io::Result<()> {
     for cancel in [false, true] {
         let path = setup_tmp_dir().await?;
