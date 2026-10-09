@@ -460,11 +460,6 @@ where
 {
     /// Return `true` if this B+Tree contains the given `key`.
     pub async fn contains(&self, key: &[S::Value]) -> Result<bool, io::Error> {
-        debug_assert!(
-            self.dir.as_dir().contains(&ROOT),
-            "B+Tree is missing its root node"
-        );
-
         let mut node = self.dir.as_dir().read_file(&ROOT).await?;
 
         loop {
@@ -499,10 +494,6 @@ where
     where
         BV: Borrow<S::Value>,
     {
-        debug_assert!(
-            self.dir.as_dir().contains(&ROOT),
-            "B+Tree is missing its root node"
-        );
         let root = self.dir.as_dir().read_file(&ROOT).await?;
         self.count_inner(range, root).await
     }
@@ -591,11 +582,6 @@ where
     where
         BV: Borrow<S::Value>,
     {
-        debug_assert!(
-            self.dir.as_dir().contains(&ROOT),
-            "B+Tree is missing its root node"
-        );
-
         let mut node = self.dir.as_dir().read_file(&ROOT).await?;
 
         match &*node {
@@ -644,11 +630,6 @@ where
     where
         BV: Borrow<S::Value>,
     {
-        debug_assert!(
-            self.dir.as_dir().contains(&ROOT),
-            "B+Tree is missing its root node"
-        );
-
         let mut node = self.dir.as_dir().read_file(&ROOT).await?;
 
         match &*node {
@@ -689,11 +670,6 @@ where
     /// Return `true` if the given `range` of this B+Tree contains zero keys.
     pub async fn is_empty<R: Borrow<Range<S::Value>>>(&self, range: R) -> Result<bool, io::Error> {
         let range = range.borrow();
-
-        debug_assert!(
-            self.dir.as_dir().contains(&ROOT),
-            "B+Tree is missing its root node"
-        );
 
         let mut node = self.dir.as_dir().read_file(&ROOT).await?;
 
@@ -767,11 +743,6 @@ where
     where
         BV: Borrow<S::Value> + Clone + Send + Sync + 'static,
     {
-        debug_assert!(
-            self.dir.as_dir().contains(&ROOT),
-            "B+Tree is missing its root node"
-        );
-
         let nodes = nodes_forward(self.dir, self.collator, range, ROOT).await?;
 
         let keys = nodes
@@ -794,11 +765,6 @@ where
     where
         BV: Borrow<S::Value> + Clone + Send + Sync + 'static,
     {
-        debug_assert!(
-            self.dir.as_dir().contains(&ROOT),
-            "B+Tree is missing its root node"
-        );
-
         let nodes = nodes_reverse(self.dir, self.collator, range, ROOT).await?;
 
         let keys = nodes
@@ -830,11 +796,6 @@ where
         if n <= self.schema.len() {
             let collator = self.collator.clone();
 
-            debug_assert!(
-                self.dir.as_dir().contains(&ROOT),
-                "B+Tree is missing its root node"
-            );
-
             let nodes = if reverse {
                 nodes_reverse(self.dir, self.collator, range, ROOT).await?
             } else {
@@ -857,11 +818,6 @@ where
     #[cfg(debug_assertions)]
     pub async fn is_valid(self) -> Result<bool, io::Error> {
         {
-            debug_assert!(
-                self.dir.as_dir().contains(&ROOT),
-                "B+Tree is missing its root node"
-            );
-
             let root = self.dir.as_dir().read_file(&ROOT).await?;
 
             match &*root {
@@ -933,7 +889,13 @@ where
     #[cfg(feature = "logging")]
     log::debug!("reading BTree keys in forward order");
 
-    let file = dir.as_dir().get_file(&node_id).expect("node").clone();
+    let Some(file) = dir.as_dir().get_file(&node_id).cloned() else {
+        return Box::pin(future::ready(Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            node_id.to_string(),
+        ))));
+    };
+
     let fut = file.into_read().map_ok(move |node| {
         let read = match &*node {
             Node::Leaf(keys) if range.is_empty() => NodeRead::Leaf((0, keys.len())),
@@ -1036,7 +998,13 @@ where
     FE: AsType<Node<V>> + Send + Sync + 'static + FileLoad,
     G: DirDeref<Entry = FE> + Clone + Send + Sync + 'static,
 {
-    let file = dir.as_dir().get_file(&node_id).expect("node").clone();
+    let Some(file) = dir.as_dir().get_file(&node_id).cloned() else {
+        return Box::pin(future::ready(Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            node_id.to_string(),
+        ))));
+    };
+
     let fut = file.into_read().map_ok(move |node| {
         let read = match &*node {
             Node::Leaf(keys) if range.is_empty() => NodeRead::Leaf((0, keys.len())),
@@ -1300,7 +1268,6 @@ where
     where
         V: Borrow<S::Value> + Send + Sync,
     {
-        debug_assert!(self.dir.contains(&ROOT), "B+Tree is missing its root node");
         let mut root = self.write_node(&ROOT).await?;
 
         let new_root = match &mut *root {
@@ -1859,7 +1826,6 @@ where
     async fn insert_root(&mut self, key: Vec<S::Value>) -> Result<bool, io::Error> {
         let order = self.schema.order();
 
-        debug_assert!(self.dir.contains(&ROOT), "B+Tree is missing its root node");
         let mut root = self.write_node(&ROOT).await?;
         let new_root = match &*root {
             Node::Leaf(keys) => {
