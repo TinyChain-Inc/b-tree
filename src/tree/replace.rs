@@ -35,6 +35,7 @@ where
                 "invalid previous row width",
             ));
         }
+
         let replacement = validate_key(&*self.schema, replacement)?;
 
         // Start just before the first equal separator: equal leaf rows may span
@@ -51,6 +52,7 @@ where
                             "invalid index node",
                         ));
                     }
+
                     let slot = bounds
                         .bisect_left(previous, &self.collator)
                         .saturating_sub(1);
@@ -60,15 +62,19 @@ where
                 Node::Leaf(rows) => {
                     let slot = rows.bisect_left(previous, &self.collator);
                     path.push((id, slot));
+
                     if slot == rows.len() {
                         drop(node);
                         path.pop();
+
                         if !self.adjacent_slot(&mut path, true).await? {
                             return Ok(false);
                         }
+
                         let &(id, _) = path.last().expect("leaf path");
                         break self.dir.read_file(&id).await?;
                     }
+
                     break node;
                 }
             }
@@ -82,6 +88,7 @@ where
                     "ambiguous collator-equivalent rows",
                 ));
             }
+
             let cmp = self.collator.cmp_slices(&replacement, row);
             ordered &= if forward { cmp.is_lt() } else { cmp.is_gt() };
             Ok(())
@@ -96,9 +103,11 @@ where
                     "expected replacement leaf",
                 ));
             };
+
             if !self.collator.cmp_slices(&rows[slot], previous).is_eq() {
                 return Ok(false);
             }
+
             for forward in [false, true] {
                 let adjacent = if forward {
                     slot.checked_add(1)
@@ -111,6 +120,7 @@ where
                     edges[usize::from(forward)] = true;
                 }
             }
+
             rows[slot] == previous
         };
         drop(node);
@@ -134,15 +144,18 @@ where
                 check_neighbor(&rows[slot], forward)?;
             }
         }
+
         if !exact {
             return Ok(false);
         }
+
         if !ordered {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "replacement must remain strictly between its neighbors",
             ));
         }
+
         if replacement == previous {
             return Ok(true);
         }
@@ -153,6 +166,7 @@ where
         while first > 0 && path[first].1 == 0 {
             first -= 1;
         }
+
         let affected = &path[first..];
         let copies = std::iter::repeat_n(replacement, affected.len());
 
@@ -170,6 +184,7 @@ where
                         "replacement bound is inconsistent with its leaf",
                     )
                 })?;
+
             prepared.push((node, slot, row));
         }
 
@@ -181,6 +196,7 @@ where
             };
             rows[slot] = row;
         }
+
         Ok(true)
     }
 
@@ -199,18 +215,21 @@ where
                     "expected index ancestor",
                 ));
             };
+
             if rows.is_empty() || rows.len() != children.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "invalid index node",
                 ));
             }
+
             let next = if forward {
                 slot.checked_add(1).filter(|i| *i < rows.len())
             } else {
                 slot.checked_sub(1)
             };
             let Some(next) = next else { continue };
+
             path.push((id, next));
             let mut child = children[next];
             drop(node);
@@ -225,6 +244,7 @@ where
                                 "empty non-root leaf",
                             ));
                         }
+
                         path.push((child, if forward { 0 } else { rows.len() - 1 }));
                         return Ok(true);
                     }
@@ -235,6 +255,7 @@ where
                                 "invalid index node",
                             ));
                         }
+
                         let slot = if forward { 0 } else { rows.len() - 1 };
                         path.push((child, slot));
                         child = children[slot];
@@ -242,6 +263,7 @@ where
                 }
             }
         }
+
         Ok(false)
     }
 }

@@ -27,6 +27,7 @@ async fn root_creation_reclaims_cached_nodes() -> io::Result<()> {
             BTreeLock::create(ExampleSchema::<i16>::new(1), Collator::default(), dir).await?;
         assert!(tree.read().await.is_empty(Range::<i16>::default()).await?);
     }
+
     root.sync().await?;
     drop(root);
 
@@ -38,6 +39,7 @@ async fn root_creation_reclaims_cached_nodes() -> io::Result<()> {
         tree.validate().await?;
         assert!(tree.read().await.is_empty(Range::<i16>::default()).await?);
     }
+
     fs::remove_dir_all(path).await
 }
 
@@ -163,6 +165,7 @@ async fn interrupted_truncate_does_not_publish_a_missing_root() -> io::Result<()
         drop(pinned);
         root.write().await.truncate_and_sync().await?;
     }
+
     Ok(())
 }
 
@@ -324,6 +327,7 @@ async fn replacement_preserves_slots_bounds_and_topology() -> io::Result<()> {
         drop(tree);
         fs::remove_dir_all(path).await?;
     }
+
     Ok(())
 }
 
@@ -727,6 +731,7 @@ async fn duplicate_insertion_needs_no_growth_admission() -> io::Result<()> {
         drop(tree);
         fs::remove_dir_all(path).await?;
     }
+
     Ok(())
 }
 
@@ -845,6 +850,7 @@ async fn lookup_between_index_bounds_uses_the_preceding_child() -> Result<(), io
             assert_eq!(first.map(|row| row[0]), (key % 2 == 0).then_some(key));
         }
     }
+
     fs::remove_dir_all(path).await
 }
 

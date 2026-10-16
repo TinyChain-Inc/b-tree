@@ -49,6 +49,7 @@ where
     {
         Box::pin(async move {
             futures::pin_mut!(keys);
+
             // A split can leave a different collator-equal row at the right edge.
             // Retain the last input to preserve exact duplicate detection.
             let (mut leaf_id, mut previous) = {
@@ -57,12 +58,14 @@ where
                     Node::Leaf(rows) => rows.last().cloned(),
                     Node::Index(..) => unreachable!("rightmost leaf"),
                 };
+
                 (id, previous)
             };
             let mut inserted = 0;
 
             while let Some(key) = keys.try_next().await? {
                 let key = validate_key(&*self.schema, key)?;
+
                 if let Some(previous) = &previous {
                     if self.collator.cmp_slices(&key, previous).is_lt() {
                         return Err(io::Error::new(
@@ -70,10 +73,12 @@ where
                             "ordered insertion precedes the current maximum",
                         ));
                     }
+
                     if previous == &key {
                         continue;
                     }
                 }
+
                 previous = Some(key.clone());
 
                 {

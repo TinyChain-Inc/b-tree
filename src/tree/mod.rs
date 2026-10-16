@@ -311,6 +311,7 @@ where
                 return Err(invalid("unbalanced BTree"));
             }
         }
+
         Ok(())
     }
 
@@ -343,6 +344,7 @@ where
                     .await?;
             }
         }
+
         Ok(Self {
             schema: self.schema.clone(),
             collator: self.collator.clone(),
