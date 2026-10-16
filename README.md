@@ -64,3 +64,9 @@ node access; operation-specific helpers remain with their operation.
 collecting them; traversal retains a path proportional to tree height. Ranges and
 stream grouping retain their collation-based meaning. Collators must order equal
 values equally, but may group unequal values.
+
+Equivalent-group navigation reuses acquired leaf guards and retains only a
+root-to-leaf path. Lookup is linear in the size of a collation-equivalent group;
+strict validation's exact duplicate checks can require quadratic equality work
+within that group. Replacement combines identity and collision checks when both
+values belong to the same group, and releases read guards before publication.
