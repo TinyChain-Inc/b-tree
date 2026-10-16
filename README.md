@@ -37,3 +37,15 @@ using their chosen codec. The examples choose TBON explicitly.
 at or beyond the current maximum. It ignores existing equal keys, returns the
 number inserted, and retains bounded traversal state. Errors or cancellation may
 leave an inserted prefix; callers own unpublished construction and recovery.
+
+Key streams copy the selected rows from one leaf before yielding them, releasing
+its payload guard. This conversion is synchronous; node traversal owns read
+concurrency. Ordered insertion retains the previous input because collator-equal
+but distinct values can change position during a split.
+
+`BTreeWriteGuard::replace` changes one exact row in place, including affected
+first-row copies in index nodes. It rejects collator-equivalent ambiguity and
+changes that would cross or collide with a neighbor; it never deletes/reinserts.
+Input checks and retained-size admission complete before synchronous publication,
+so rejection or cancellation before publication leaves row contents unchanged.
+This is not a durability or cross-index atomicity guarantee.
