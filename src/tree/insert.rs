@@ -6,14 +6,10 @@ use collate::Collate;
 use freqfs::{DirDeref, DirWriteGuardOwned, FileLoad, FileReadGuard, FileWriteGuardOwned};
 use futures::future::Future;
 use futures::stream::{Stream, TryStreamExt};
-use get_size::GetSize;
 use safecast::AsType;
 use uuid::Uuid;
 
-use super::{
-    BTree, Node, ROOT, Schema, size_overflow, validate_collator_eq, validate_key,
-    validate_schema_eq,
-};
+use super::{BTree, Node, ROOT, Schema, validate_collator_eq, validate_key, validate_schema_eq};
 use crate::node::Block;
 use crate::range::Range;
 
@@ -95,8 +91,6 @@ where
                     };
 
                     if !rows.is_empty() && rows.len() < limit {
-                        self.reserve_node(&mut leaf, 1, key.get_heap_size(), 0)
-                            .await?;
                         let Node::Leaf(rows) = &mut *leaf else {
                             unreachable!("rightmost leaf")
                         };
@@ -134,40 +128,7 @@ where
         &mut self,
         node: Node<S::Value>,
     ) -> Result<(Uuid, freqfs::FileLock<FE>), io::Error> {
-        let bound = mem::size_of::<FE>()
-            .checked_add(node.get_size())
-            .ok_or_else(size_overflow)?;
-
-        self.dir.create_file_unique(node, bound).await
-    }
-
-    async fn reserve_insert(
-        &self,
-        node: &mut FileWriteGuardOwned<FE, Node<S::Value>>,
-        result: &Insert<S::Value>,
-    ) -> Result<(), io::Error> {
-        match result {
-            Insert::None | Insert::Right => Ok(()),
-            Insert::Left(key) => {
-                self.reserve_node(node, 0, Vec::<S::Value>::get_heap_size(key), 0)
-                    .await
-            }
-            Insert::Overflow(key, _) => {
-                self.reserve_node(node, 1, Vec::<S::Value>::get_heap_size(key), 1)
-                    .await
-            }
-            Insert::OverflowLeft(left, middle, _) => {
-                self.reserve_node(
-                    node,
-                    1,
-                    Vec::<S::Value>::get_heap_size(left)
-                        .checked_add(Vec::<S::Value>::get_heap_size(middle))
-                        .ok_or_else(size_overflow)?,
-                    1,
-                )
-                .await
-            }
-        }
+        self.dir.create_file_unique(node).await
     }
 
     async fn insert_root(&mut self, key: Vec<S::Value>) -> Result<bool, io::Error> {
@@ -183,15 +144,13 @@ where
                     return Ok(false);
                 }
 
-                self.reserve_node(&mut root, 1, key.get_heap_size(), 0)
-                    .await?;
                 let Node::Leaf(keys) = &mut *root else {
                     unreachable!("leaf")
                 };
                 keys.insert(i, key);
 
                 if keys.len() > order {
-                    let mid = div_ceil(order, 2);
+                    let mid = order.div_ceil(2);
 
                     let right: Vec<_> = keys.drain(mid..).collect();
                     debug_assert!(right.len() >= mid);
@@ -221,7 +180,6 @@ where
 
                 let mut child = self.write_node(&children[i]).await?;
                 let result = self.insert_inner(&mut child, key).await?;
-                self.reserve_insert(&mut root, &result).await?;
                 let Node::Index(bounds, children) = &mut *root else {
                     unreachable!("index")
                 };
@@ -247,8 +205,8 @@ where
                 debug_assert_eq!(bounds.len(), children.len());
 
                 if children.len() > order {
-                    let right_bounds: Vec<_> = bounds.drain(div_ceil(order, 2)..).collect();
-                    let right_children: Vec<_> = children.drain(div_ceil(order, 2)..).collect();
+                    let right_bounds: Vec<_> = bounds.drain(order.div_ceil(2)..).collect();
+                    let right_children: Vec<_> = children.drain(order.div_ceil(2)..).collect();
                     let right_bound = right_bounds[0].clone();
                     let (right_node_id, _) = self
                         .create_node(Node::Index(right_bounds, right_children))
@@ -272,12 +230,6 @@ where
         };
 
         if let Some(new_root) = new_root {
-            root.reserve(
-                mem::size_of::<FE>()
-                    .checked_add(new_root.get_size())
-                    .ok_or_else(size_overflow)?,
-            )
-            .await?;
             *root = new_root;
         }
 
@@ -300,7 +252,6 @@ where
                         return Ok(Insert::None);
                     }
 
-                    self.reserve_node(node, 1, key.get_heap_size(), 0).await?;
                     let Node::Leaf(keys) = &mut **node else {
                         unreachable!("leaf")
                     };
@@ -349,7 +300,6 @@ where
                     let mut child = self.write_node(&children[i]).await?;
 
                     let result = self.insert_inner(&mut child, key).await?;
-                    self.reserve_insert(node, &result).await?;
                     let Node::Index(bounds, children) = &mut **node else {
                         unreachable!("index")
                     };
@@ -381,7 +331,7 @@ where
                     // debug_assert!(self.collator.is_sorted(bounds));
 
                     if children.len() > order {
-                        let mid = div_ceil(self.schema.order(), 2);
+                        let mid = self.schema.order().div_ceil(2);
                         let new_bounds: Vec<_> = bounds.drain(mid..).collect();
                         let new_children: Vec<_> = children.drain(mid..).collect();
 
@@ -431,13 +381,5 @@ where
         }
 
         Ok(())
-    }
-}
-
-#[inline]
-fn div_ceil(num: usize, denom: usize) -> usize {
-    match num % denom {
-        0 => num / denom,
-        _ => (num / denom) + 1,
     }
 }

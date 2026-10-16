@@ -1,14 +1,13 @@
-//! Order-preserving replacement validates and admits all changes before publication.
+//! Order-preserving replacement validates all changes before publication.
 
-use std::{io, mem};
+use std::io;
 
 use collate::Collate;
 use freqfs::{DirWriteGuardOwned, FileLoad};
-use get_size::GetSize;
 use safecast::AsType;
 use uuid::Uuid;
 
-use super::{BTree, Node, ROOT, Schema, size_overflow, validate_key};
+use super::{BTree, Node, ROOT, Schema, validate_key};
 use crate::node::Block;
 
 impl<S, C, FE> BTree<S, C, DirWriteGuardOwned<FE>>
@@ -23,7 +22,7 @@ where
     /// the previous row. Returns false when the previous row is absent.
     /// Collator-equivalent ambiguity, collisions, and relocation are rejected
     /// before any row contents change.
-    /// All validation and capacity admission precede the synchronous publication;
+    /// All validation and guard acquisition precede the synchronous publication;
     /// this does not provide durability or atomicity across multiple indexes.
     pub async fn replace(
         &mut self,
@@ -159,12 +158,11 @@ where
 
         let mut prepared = Vec::with_capacity(affected.len());
         for (&(id, slot), row) in affected.iter().zip(copies) {
-            let mut node = self.write_node(&id).await?;
+            let node = self.write_node(&id).await?;
             let rows = match &*node {
                 Node::Leaf(rows) | Node::Index(rows, _) => rows,
             };
-            let old = rows
-                .get(slot)
+            rows.get(slot)
                 .filter(|row| row.as_slice() == previous)
                 .ok_or_else(|| {
                     io::Error::new(
@@ -172,16 +170,6 @@ where
                         "replacement bound is inconsistent with its leaf",
                     )
                 })?;
-            let old_heap = old.get_heap_size();
-            let new_heap = row.get_heap_size();
-            if new_heap > old_heap {
-                let bound = mem::size_of::<FE>()
-                    .checked_add((*node).get_heap_size())
-                    .and_then(|size| size.checked_sub(old_heap))
-                    .and_then(|size| size.checked_add(new_heap))
-                    .ok_or_else(size_overflow)?;
-                node.reserve(bound).await?;
-            }
             prepared.push((node, slot, row));
         }
 

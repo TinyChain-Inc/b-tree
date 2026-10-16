@@ -429,7 +429,9 @@ where
 enum NodeRead {
     Excluded,
     Child(Uuid),
-    Children(Box<SmallVec<[Uuid; NODE_STACK_SIZE]>>),
+    // Keep the enum small without boxing inline storage. A boxed SmallVec would
+    // allocate even for short lists and allocate again when it spills.
+    Children(Vec<Uuid>),
     Leaf((usize, usize)),
 }
 
@@ -491,7 +493,7 @@ where
                 if children.len() == 1 {
                     NodeRead::Child(children[0])
                 } else {
-                    NodeRead::Children(Box::new(SmallVec::from_slice(children)))
+                    NodeRead::Children(children.to_vec())
                 }
             }
             Node::Index(bounds, children) => {
@@ -505,7 +507,7 @@ where
                 } else if l == r || l + 1 == r {
                     NodeRead::Child(children[l])
                 } else {
-                    NodeRead::Children(Box::new(SmallVec::from_slice(&children[l..r])))
+                    NodeRead::Children(children[l..r].to_vec())
                 }
             }
         };
@@ -600,7 +602,7 @@ where
                 if children.len() == 1 {
                     NodeRead::Child(children[0])
                 } else {
-                    NodeRead::Children(Box::new(SmallVec::from_slice(children)))
+                    NodeRead::Children(children.to_vec())
                 }
             }
             Node::Index(bounds, children) => {
@@ -616,7 +618,7 @@ where
                 } else if l == r || l + 1 == r {
                     NodeRead::Child(children[l])
                 } else {
-                    NodeRead::Children(Box::new(SmallVec::from_slice(&children[l..r])))
+                    NodeRead::Children(children[l..r].to_vec())
                 }
             }
         };

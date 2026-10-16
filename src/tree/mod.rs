@@ -1,11 +1,11 @@
-//! Native tree ownership and shared node admission.
+//! Native tree ownership and shared node access.
 //!
 //! Reading, insertion, deletion, replacement, and decoding live in private
-//! operation modules. Public handles and persisted nodes are unchanged.
+//! operation modules.
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::{fmt, io, mem, pin::Pin};
+use std::{fmt, io, pin::Pin};
 
 use collate::Collate;
 use freqfs::{
@@ -13,7 +13,6 @@ use freqfs::{
     FileSave, FileWriteGuardOwned,
 };
 use futures::{FutureExt, Stream};
-use get_size::GetSize;
 use safecast::AsType;
 use uuid::Uuid;
 
@@ -384,32 +383,6 @@ where
     }
 }
 
-fn size_overflow() -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, "BTree retained size overflow")
-}
-
-fn vec_growth<T>(values: &Vec<T>, additional: usize) -> Result<usize, io::Error> {
-    let required = values
-        .len()
-        .checked_add(additional)
-        .ok_or_else(size_overflow)?;
-
-    if required <= values.capacity() {
-        return Ok(0);
-    }
-
-    let capacity = values
-        .capacity()
-        .checked_mul(2)
-        .ok_or_else(size_overflow)?
-        .max(required)
-        .max(4);
-
-    (capacity - values.capacity())
-        .checked_mul(mem::size_of::<T>())
-        .ok_or_else(size_overflow)
-}
-
 impl<S, C, FE> BTree<S, C, DirWriteGuardOwned<FE>> {
     /// Downgrade this [`BTreeWriteGuard`] into a [`BTreeReadGuard`].
     pub fn downgrade(self) -> BTreeReadGuard<S, C, FE> {
@@ -431,34 +404,7 @@ where
         &self,
         id: &Uuid,
     ) -> Result<FileWriteGuardOwned<FE, Node<S::Value>>, io::Error> {
-        self.dir.write_file_owned(id, 0).await
-    }
-
-    async fn reserve_node(
-        &self,
-        node: &mut FileWriteGuardOwned<FE, Node<S::Value>>,
-        rows: usize,
-        row_heap: usize,
-        children: usize,
-    ) -> Result<(), io::Error> {
-        let keys = match &**node {
-            Node::Leaf(keys) | Node::Index(keys, _) => keys,
-        };
-        let growth = vec_growth(keys, rows)?;
-        let child_growth = match &**node {
-            Node::Index(_, ids) => vec_growth(ids, children)?,
-            Node::Leaf(_) => children
-                .checked_mul(mem::size_of::<Uuid>())
-                .ok_or_else(size_overflow)?,
-        };
-        let bound = mem::size_of::<FE>()
-            .checked_add((**node).get_size())
-            .and_then(|size| size.checked_add(growth))
-            .and_then(|size| size.checked_add(row_heap))
-            .and_then(|size| size.checked_add(child_growth))
-            .ok_or_else(size_overflow)?;
-
-        node.reserve(bound).await
+        self.dir.write_file_owned(id).await
     }
 }
 

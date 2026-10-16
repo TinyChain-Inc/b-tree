@@ -11,7 +11,7 @@ use get_size::GetSize;
 use safecast::AsType;
 use uuid::Uuid;
 
-use super::{BTree, Node, ROOT, Schema, size_overflow, validate_collator_eq, validate_schema_eq};
+use super::{BTree, Node, ROOT, Schema, validate_collator_eq, validate_schema_eq};
 use crate::node::Block;
 use crate::range::Range;
 
@@ -46,70 +46,12 @@ enum Delete<FE: GetSize, V> {
     Underflow(FileWriteGuardOwned<FE, Node<V>>),
 }
 
-fn rows_heap<T: GetSize>(rows: &[Vec<T>]) -> Result<usize, io::Error> {
-    rows.iter().try_fold(0usize, |size, row| {
-        size.checked_add(row.get_heap_size())
-            .ok_or_else(size_overflow)
-    })
-}
-
-fn maximum_row_heap<T: GetSize>(node: &Node<T>) -> usize {
-    let rows = match node {
-        Node::Leaf(rows) | Node::Index(rows, _) => rows,
-    };
-
-    rows.iter().map(GetSize::get_heap_size).max().unwrap_or(0)
-}
-
 impl<S, C, FE> BTree<S, C, DirWriteGuardOwned<FE>>
 where
     S: Schema + Send + Sync,
     C: Collate<Value = S::Value> + Send + Sync,
     FE: AsType<Node<S::Value>> + Send + Sync + FileLoad,
 {
-    // Admit transfers before lending payloads to the existing merge helpers.
-    async fn reserve_merge(
-        &self,
-        parent: &mut FileWriteGuardOwned<FE, Node<S::Value>>,
-        child: &mut FileWriteGuardOwned<FE, Node<S::Value>>,
-        i: usize,
-    ) -> Result<(), io::Error> {
-        let Node::Index(_, children) = &**parent else {
-            unreachable!("index")
-        };
-        let mut sibling = children[if i == 0 { 1 } else { i - 1 }];
-        let mut row_heap = maximum_row_heap(child);
-
-        loop {
-            let (maximum, next) = {
-                let node = self.dir.read_file::<_, Node<S::Value>>(&sibling).await?;
-                let next = match &*node {
-                    Node::Index(_, children) if child.is_leaf() && i == 0 => {
-                        children.first().copied()
-                    }
-                    _ => None,
-                };
-                (maximum_row_heap(&node), next)
-            };
-            row_heap = row_heap.max(maximum);
-            if let Some(next) = next {
-                sibling = next;
-            } else {
-                break;
-            }
-        }
-
-        self.reserve_node(
-            parent,
-            0,
-            row_heap.checked_mul(2).ok_or_else(size_overflow)?,
-            0,
-        )
-        .await?;
-        self.reserve_node(child, 1, row_heap, usize::from(!child.is_leaf()))
-            .await
-    }
-
     /// Delete the given `key` from this B+Tree.
     pub async fn delete<V>(&mut self, key: &[V]) -> Result<bool, io::Error>
     where
@@ -138,8 +80,6 @@ where
                     Delete::None => return Ok(false),
                     Delete::Right => return Ok(true),
                     Delete::Left(bound) => {
-                        self.reserve_node(&mut root, 0, bound.get_heap_size(), 0)
-                            .await?;
                         let Node::Index(bounds, _) = &mut *root else {
                             unreachable!("index")
                         };
@@ -147,7 +87,6 @@ where
                         return Ok(true);
                     }
                     Delete::Underflow(mut node) => {
-                        self.reserve_merge(&mut root, &mut node, i).await?;
                         let Node::Index(bounds, children) = &mut *root else {
                             unreachable!("index")
                         };
@@ -190,12 +129,6 @@ where
                 }
             };
 
-            root.reserve(
-                mem::size_of::<FE>()
-                    .checked_add(new_root.get_size())
-                    .ok_or_else(size_overflow)?,
-            )
-            .await?;
             self.dir.delete(&only_child).await;
 
             *root = new_root;
@@ -242,8 +175,6 @@ where
                         Delete::None => return Ok(Delete::None),
                         Delete::Right => return Ok(Delete::Right),
                         Delete::Left(bound) => {
-                            self.reserve_node(&mut node, 0, bound.get_heap_size(), 0)
-                                .await?;
                             let Node::Index(bounds, _) = &mut *node else {
                                 unreachable!("index")
                             };
@@ -256,7 +187,6 @@ where
                             };
                         }
                         Delete::Underflow(mut child) => {
-                            self.reserve_merge(&mut node, &mut child, i).await?;
                             let Node::Index(bounds, children) = &mut *node else {
                                 unreachable!("index")
                             };
@@ -347,14 +277,6 @@ where
     ) -> Pin<Box<dyn Future<Output = ResultMergeIndex<S::Value>> + Send + 'a>> {
         Box::pin(async move {
             let mut node = self.write_node(node_id).await?;
-            self.reserve_node(
-                &mut node,
-                left_bounds.len(),
-                rows_heap(left_bounds)?,
-                left_children.len(),
-            )
-            .await?;
-
             match &mut *node {
                 Node::Leaf(_right_keys) => unreachable!("merge a leaf node with an index node"),
                 Node::Index(right_bounds, right_children) => {
@@ -391,14 +313,6 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<MergeIndexRight, io::Error>> + Send + 'a>> {
         Box::pin(async move {
             let mut node = self.write_node(node_id).await?;
-            self.reserve_node(
-                &mut node,
-                right_bounds.len(),
-                rows_heap(right_bounds)?,
-                right_children.len(),
-            )
-            .await?;
-
             match &mut *node {
                 Node::Leaf(_left_keys) => unreachable!("merge a leaf node with an index node"),
                 Node::Index(left_bounds, left_children) => {
@@ -466,9 +380,6 @@ where
     ) -> Pin<Box<dyn Future<Output = ResultMergeLeaf<S::Value>> + Send + 'a>> {
         Box::pin(async move {
             let mut node = self.write_node(node_id).await?;
-            self.reserve_node(&mut node, left_keys.len(), rows_heap(left_keys)?, 0)
-                .await?;
-
             match &mut *node {
                 Node::Leaf(right_keys) => {
                     if right_keys.len() > (self.schema.order() / 2) {
@@ -485,11 +396,6 @@ where
                 }
                 Node::Index(_, children) => {
                     let result = self.merge_leaf_left(left_keys, &children[0]).await?;
-                    let bound = match &result {
-                        MergeLeafLeft::Borrow(bound) | MergeLeafLeft::Merge(bound) => bound,
-                    };
-                    self.reserve_node(&mut node, 0, bound.get_heap_size(), 0)
-                        .await?;
                     let Node::Index(bounds, _) = &mut *node else {
                         unreachable!("index")
                     };
@@ -515,9 +421,6 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<MergeLeafRight, io::Error>> + Send + 'a>> {
         Box::pin(async move {
             let mut node = self.write_node(node_id).await?;
-            self.reserve_node(&mut node, right_keys.len(), rows_heap(right_keys)?, 0)
-                .await?;
-
             match &mut *node {
                 Node::Leaf(left_keys) => {
                     if left_keys.len() > (self.schema.order() / 2) {
