@@ -280,17 +280,33 @@ where
                     .any(|key| self.schema.validate_key(key.clone()).is_err())
                 || keys
                     .windows(2)
-                    .any(|pair| !self.collator.cmp(&pair[0], &pair[1]).is_lt())
-                || lower.as_ref().is_some_and(|lower| {
-                    keys.first()
-                        .is_none_or(|first| !self.collator.cmp(first, lower).is_eq())
-                })
+                    .any(|pair| self.collator.cmp(&pair[0], &pair[1]).is_gt())
+                || lower
+                    .as_ref()
+                    .is_some_and(|lower| keys.first().is_none_or(|first| first != lower))
                 || upper.as_ref().is_some_and(|upper| {
                     keys.last()
-                        .is_some_and(|last| !self.collator.cmp(last, upper).is_lt())
+                        .is_some_and(|last| self.collator.cmp(last, upper).is_gt())
                 })
             {
                 return Err(invalid("invalid BTree bounds"));
+            }
+            if let Node::Leaf(rows) = &*node {
+                for (i, row) in rows.iter().enumerate() {
+                    // Only collation ties need an identity scan; bounds are copies,
+                    // not additional values. Scan without collecting the group.
+                    let tied = rows
+                        .get(i + 1)
+                        .is_some_and(|next| self.collator.cmp(row, next).is_eq())
+                        || i.checked_sub(1)
+                            .is_some_and(|j| self.collator.cmp(row, &rows[j]).is_eq())
+                        || upper
+                            .as_ref()
+                            .is_some_and(|upper| self.collator.cmp(row, upper).is_eq());
+                    if tied {
+                        tree.get(row).await?;
+                    }
+                }
             }
             if let Node::Index(bounds, children) = &*node {
                 if bounds.is_empty() || bounds.len() != children.len() {

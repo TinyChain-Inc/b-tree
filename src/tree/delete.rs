@@ -12,7 +12,6 @@ use safecast::AsType;
 use uuid::Uuid;
 
 use super::{BTree, Node, ROOT, Schema, validate_collator_eq, validate_schema_eq};
-use crate::node::Block;
 use crate::range::Range;
 
 type ResultDelete<FE, V> = Result<Delete<FE, V>, io::Error>;
@@ -57,11 +56,15 @@ where
     where
         V: Borrow<S::Value> + Send + Sync,
     {
+        let (path, present) = self.locate(key).await?;
+        if !present {
+            return Ok(false);
+        }
         let mut root = self.write_node(&ROOT).await?;
 
         let new_root = match &mut *root {
             Node::Leaf(keys) => {
-                let i = keys.bisect_left(key, &self.collator);
+                let i = path[0].1;
                 if i < keys.len() && keys[i].iter().zip(key).all(|(l, r)| l == r.borrow()) {
                     keys.remove(i);
                     return Ok(true);
@@ -69,14 +72,11 @@ where
                     return Ok(false);
                 }
             }
-            Node::Index(bounds, children) => {
-                let i = match bounds.bisect_right(key, &self.collator) {
-                    0 => return Ok(false),
-                    i => i - 1,
-                };
+            Node::Index(_, children) => {
+                let i = path[0].1;
 
                 let node = self.write_node(&children[i]).await?;
-                match self.delete_inner(node, key).await? {
+                match self.delete_inner(node, key, &path[1..]).await? {
                     Delete::None => return Ok(false),
                     Delete::Right => return Ok(true),
                     Delete::Left(bound) => {
@@ -141,6 +141,7 @@ where
         &'a mut self,
         mut node: FileWriteGuardOwned<FE, Node<S::Value>>,
         key: &'a [V],
+        path: &'a [(Uuid, usize)],
     ) -> Pin<Box<dyn Future<Output = ResultDelete<FE, S::Value>> + Send + 'a>>
     where
         V: Borrow<S::Value> + Send + Sync,
@@ -148,7 +149,7 @@ where
         Box::pin(async move {
             match &mut *node {
                 Node::Leaf(keys) => {
-                    let i = keys.bisect_left(key, &self.collator);
+                    let i = path[0].1;
 
                     if i < keys.len() && keys[i].iter().zip(key).all(|(l, r)| l == r.borrow()) {
                         keys.remove(i);
@@ -164,14 +165,11 @@ where
                         Ok(Delete::None)
                     }
                 }
-                Node::Index(bounds, children) => {
-                    let i = match bounds.bisect_right(key, &self.collator) {
-                        0 => return Ok(Delete::None),
-                        i => i - 1,
-                    };
+                Node::Index(_, children) => {
+                    let i = path[0].1;
 
                     let child = self.write_node(&children[i]).await?;
-                    match self.delete_inner(child, key).await? {
+                    match self.delete_inner(child, key, &path[1..]).await? {
                         Delete::None => return Ok(Delete::None),
                         Delete::Right => return Ok(Delete::Right),
                         Delete::Left(bound) => {

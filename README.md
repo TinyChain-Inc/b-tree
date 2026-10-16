@@ -40,14 +40,16 @@ leave an inserted prefix; callers own unpublished construction and recovery.
 
 Key streams copy the selected rows from one leaf before yielding them, releasing
 its payload guard. This conversion is synchronous; node traversal owns read
-concurrency. Ordered insertion retains the previous input because collator-equal
-but distinct values can change position during a split.
+concurrency. Ordered insertion checks duplicates across the equivalent group
+when the next input ties the previous collation.
 
 `BTreeWriteGuard::replace` changes one exact row in place, including affected
-first-row copies in index nodes. It rejects collator-equivalent ambiguity and
-changes that would cross or collide with a neighbor; it never deletes/reinserts.
+first-row copies in index nodes. It distinguishes semantic equality from collation ties and rejects
+changes that would cross a neighbor or duplicate another value; it never deletes/reinserts.
 A replacement may compare differently from its previous value, provided it remains
-strictly between its actual predecessor and successor. This public operation is
+between its actual predecessor and successor, allowing unequal values with equal
+collation. Replacement always publishes the supplied row, even when it is
+semantically equal to the old row. This public operation is
 safe to call directly; callers need no additional ordering guard.
 Input checks and affected-node validation complete before synchronous publication,
 so rejection or cancellation before publication leaves row contents unchanged.
@@ -56,3 +58,9 @@ This is not a durability or cross-index atomicity guarantee.
 The private `tree` modules separate reads/traversal, insertion, deletion,
 replacement, and stream decoding. The module root owns public handles and shared
 node access; operation-specific helpers remain with their operation.
+
+`get(prefix)` resolves one semantic prefix and rejects multiple matching rows.
+`contains`, insertion, deletion, and replacement search equivalent groups without
+collecting them; traversal retains a path proportional to tree height. Ranges and
+stream grouping retain their collation-based meaning. Collators must order equal
+values equally, but may group unequal values.
