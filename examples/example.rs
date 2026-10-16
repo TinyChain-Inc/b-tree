@@ -208,19 +208,43 @@ async fn sorted_ingestion_retains_last_input_across_equal_collator_splits() -> i
         .await?;
     actual.sort();
     assert_eq!(actual, (0..=order).collect::<Vec<_>>());
-    for previous in [0, order, order + 1] {
-        let error = tree
-            .write()
-            .await
-            .replace(&[previous], vec![100])
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    for key in 0..=order {
+        assert!(tree.read().await.contains(&[key]).await?);
+        assert!(!tree.write().await.insert(vec![key]).await?);
     }
     assert_eq!(
-        tree.read().await.count(&Range::<i16>::default()).await?,
-        (order + 1) as u64
+        tree.write()
+            .await
+            .insert_sorted(futures::stream::iter([Ok(vec![0]), Ok(vec![order])]))
+            .await?,
+        0
     );
+    assert!(tree.write().await.replace(&[0], vec![100]).await?);
+    assert!(!tree.write().await.replace(&[order + 1], vec![101]).await?);
+    assert_eq!(
+        tree.write()
+            .await
+            .replace(&[100], vec![order])
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    for key in order + 1..40 {
+        assert!(tree.write().await.insert(vec![key]).await?);
+    }
+    tree.validate().await?;
+    tree.sync_all().await?;
+    drop(tree);
+    let dir = Cache::<File>::new(1024 * 1024, None, 0, std::time::Duration::from_secs(1))
+        .load(path.clone())?;
+    let tree = BTreeLock::load(ExampleSchema::<i16>::new(1), Equal, dir)?;
+    tree.validate().await?;
+    for key in (1..40).chain([100]) {
+        assert!(tree.read().await.contains(&[key]).await?, "missing {key}");
+        assert!(tree.write().await.delete(&[key]).await?, "delete {key}");
+    }
+    assert_eq!(tree.read().await.count(&Range::<i16>::default()).await?, 0);
 
     drop(tree);
     fs::remove_dir_all(path).await
@@ -269,7 +293,7 @@ async fn replacement_preserves_slots_bounds_and_topology() -> io::Result<()> {
                 io::ErrorKind::InvalidInput
             );
             if count > 1 {
-                for replacement in [10, 11, count * 10] {
+                for replacement in [10, 20, count * 10] {
                     assert_eq!(
                         write
                             .replace(&[0], vec![replacement])
@@ -374,7 +398,7 @@ async fn replacement_accounts_actual_retained_growth() -> io::Result<()> {
 }
 
 #[tokio::test]
-async fn replacement_rejects_ambiguity_across_leaves() -> io::Result<()> {
+async fn replacement_distinguishes_equivalent_rows_across_leaves() -> io::Result<()> {
     use uuid::Uuid;
 
     #[derive(Clone, Eq, PartialEq)]
@@ -404,17 +428,25 @@ async fn replacement_rejects_ambiguity_across_leaves() -> io::Result<()> {
         dir.write().await.create_file(id.to_string(), node).await?;
     }
     let tree = BTreeLock::load(ExampleSchema::<i16>::new(1), Equal, dir.clone())?;
-    for previous in [0, 1, 2] {
-        assert_eq!(
+    for previous in [0, 1] {
+        assert!(
             tree.write()
                 .await
                 .replace(&[previous], vec![previous])
-                .await
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
+                .await?
         );
     }
+    assert!(!tree.write().await.replace(&[2], vec![2]).await?);
+    assert!(tree.write().await.replace(&[0], vec![2]).await?);
+    assert_eq!(
+        tree.write()
+            .await
+            .replace(&[1], vec![2])
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
     let rows: Vec<_> = tree
         .read()
         .await
@@ -423,7 +455,7 @@ async fn replacement_rejects_ambiguity_across_leaves() -> io::Result<()> {
         .map_ok(|row| row[0])
         .try_collect()
         .await?;
-    assert_eq!(rows, [0, 1]);
+    assert_eq!(rows, [2, 1]);
     drop(tree);
     drop(dir);
     fs::remove_dir_all(path).await
@@ -694,9 +726,9 @@ async fn duplicate_insertion_needs_no_growth_admission() -> io::Result<()> {
                 duplicate.push(i);
                 assert!(!write.insert(duplicate).await?);
             }
-            let mut unchanged = Vec::with_capacity(1_000_000);
-            unchanged.push(0);
-            assert!(write.replace(&[0], unchanged).await?);
+            // Replacement always publishes the supplied row; only insertion
+            // duplicates retain the old allocation without mutation.
+            assert!(write.replace(&[0], vec![0]).await?);
             // The collator value changes, but the first row keeps its position
             // before its successor. Replacement does not require collation equality.
             assert!(write.replace(&[0], vec![-1]).await?);

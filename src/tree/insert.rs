@@ -10,13 +10,11 @@ use safecast::AsType;
 use uuid::Uuid;
 
 use super::{BTree, Node, ROOT, Schema, validate_collator_eq, validate_key, validate_schema_eq};
-use crate::node::Block;
 use crate::range::Range;
 
 type ResultInsert<V> = Result<Insert<V>, io::Error>;
 
 enum Insert<V> {
-    None,
     Left(Vec<V>),
     Right,
     OverflowLeft(Vec<V>, Vec<V>, Uuid),
@@ -74,7 +72,9 @@ where
                         ));
                     }
 
-                    if previous == &key {
+                    if self.collator.cmp_slices(&key, previous).is_eq()
+                        && self.contains(&key).await?
+                    {
                         continue;
                     }
                 }
@@ -137,17 +137,16 @@ where
     }
 
     async fn insert_root(&mut self, key: Vec<S::Value>) -> Result<bool, io::Error> {
+        let (path, present) = self.locate(&key).await?;
+        if present {
+            return Ok(false);
+        }
         let order = self.schema.order();
 
         let mut root = self.write_node(&ROOT).await?;
         let new_root = match &*root {
-            Node::Leaf(keys) => {
-                let i = keys.bisect_left(&key, &self.collator);
-
-                if keys.get(i) == Some(&key) {
-                    // no-op
-                    return Ok(false);
-                }
+            Node::Leaf(_) => {
+                let i = path[0].1;
 
                 let Node::Leaf(keys) = &mut *root else {
                     unreachable!("leaf")
@@ -177,20 +176,15 @@ where
             Node::Index(bounds, children) => {
                 debug_assert_eq!(bounds.len(), children.len());
 
-                // Equality belongs to this child, whose first key is the bound.
-                let i = match bounds.bisect_right(&key, &self.collator) {
-                    0 => 0,
-                    i => i - 1,
-                };
+                let i = path[0].1;
 
                 let mut child = self.write_node(&children[i]).await?;
-                let result = self.insert_inner(&mut child, key).await?;
+                let result = self.insert_inner(&mut child, key, &path[1..]).await?;
                 let Node::Index(bounds, children) = &mut *root else {
                     unreachable!("index")
                 };
 
                 match result {
-                    Insert::None => return Ok(false),
                     Insert::Right => {}
                     Insert::Left(key) => {
                         bounds[i] = key;
@@ -245,17 +239,13 @@ where
         &'a mut self,
         node: &'a mut FileWriteGuardOwned<FE, Node<S::Value>>,
         key: Vec<S::Value>,
+        path: &'a [(Uuid, usize)],
     ) -> Pin<Box<dyn Future<Output = ResultInsert<S::Value>> + Send + 'a>> {
         Box::pin(async move {
             let order = self.schema.order();
             match &**node {
-                Node::Leaf(keys) => {
-                    let i = keys.bisect_left(&key, &self.collator);
-
-                    if i < keys.len() && keys[i] == key {
-                        // no-op
-                        return Ok(Insert::None);
-                    }
+                Node::Leaf(_) => {
+                    let i = path[0].1;
 
                     let Node::Leaf(keys) = &mut **node else {
                         unreachable!("leaf")
@@ -296,20 +286,15 @@ where
                 Node::Index(bounds, children) => {
                     debug_assert_eq!(bounds.len(), children.len());
 
-                    // Equality belongs to this child, whose first key is the bound.
-                    let i = match bounds.bisect_right(&key, &self.collator) {
-                        0 => 0,
-                        i => i - 1,
-                    };
+                    let i = path[0].1;
 
                     let mut child = self.write_node(&children[i]).await?;
 
-                    let result = self.insert_inner(&mut child, key).await?;
+                    let result = self.insert_inner(&mut child, key, &path[1..]).await?;
                     let Node::Index(bounds, children) = &mut **node else {
                         unreachable!("index")
                     };
                     let overflow_left = match result {
-                        Insert::None => return Ok(Insert::None),
                         Insert::Right => return Ok(Insert::Right),
                         Insert::Left(key) => {
                             bounds[i] = key;
