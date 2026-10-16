@@ -27,6 +27,7 @@ async fn root_creation_reclaims_cached_nodes() -> io::Result<()> {
             BTreeLock::create(ExampleSchema::<i16>::new(1), Collator::default(), dir).await?;
         assert!(tree.read().await.is_empty(Range::<i16>::default()).await?);
     }
+
     root.sync().await?;
     drop(root);
 
@@ -38,6 +39,7 @@ async fn root_creation_reclaims_cached_nodes() -> io::Result<()> {
         tree.validate().await?;
         assert!(tree.read().await.is_empty(Range::<i16>::default()).await?);
     }
+
     fs::remove_dir_all(path).await
 }
 
@@ -67,6 +69,7 @@ async fn missing_root_returns_errors_without_repair() -> io::Result<()> {
         "groups_rev",
         "insert",
         "insert_sorted",
+        "replace",
         "delete",
         "validate",
     ] {
@@ -92,6 +95,7 @@ async fn missing_root_returns_errors_without_repair() -> io::Result<()> {
                 }
             }
             "insert" => tree.write().await.insert(vec![2]).await.map(|_| ()),
+            "replace" => tree.write().await.replace(&[1], vec![2]).await.map(|_| ()),
             "insert_sorted" => tree
                 .write()
                 .await
@@ -161,12 +165,344 @@ async fn interrupted_truncate_does_not_publish_a_missing_root() -> io::Result<()
         drop(pinned);
         root.write().await.truncate_and_sync().await?;
     }
+
     Ok(())
+}
+
+#[tokio::test]
+async fn sorted_ingestion_retains_last_input_across_equal_collator_splits() -> io::Result<()> {
+    #[derive(Clone, Eq, PartialEq)]
+    struct Equal;
+
+    impl collate::Collate for Equal {
+        type Value = i16;
+
+        fn cmp(&self, _: &i16, _: &i16) -> std::cmp::Ordering {
+            std::cmp::Ordering::Equal
+        }
+    }
+
+    let path = setup_tmp_dir().await?;
+    let cache = Cache::<File>::new(1024 * 1024, None, 0, std::time::Duration::from_secs(1));
+    let dir = cache.load(path.clone())?;
+    let schema = ExampleSchema::<i16>::new(1);
+    let order = schema.order() as i16;
+    let tree = BTreeLock::create(schema, Equal, dir).await?;
+    let keys = (0..=order).chain([order]).map(|i| Ok(vec![i]));
+
+    assert_eq!(
+        tree.write()
+            .await
+            .insert_sorted(futures::stream::iter(keys))
+            .await?,
+        (order + 1) as u64
+    );
+
+    let mut actual: Vec<_> = tree
+        .read()
+        .await
+        .keys(Range::<i16>::default())
+        .await?
+        .map_ok(|key| key[0])
+        .try_collect()
+        .await?;
+    actual.sort();
+    assert_eq!(actual, (0..=order).collect::<Vec<_>>());
+    for previous in [0, order, order + 1] {
+        let error = tree
+            .write()
+            .await
+            .replace(&[previous], vec![100])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+    assert_eq!(
+        tree.read().await.count(&Range::<i16>::default()).await?,
+        (order + 1) as u64
+    );
+
+    drop(tree);
+    fs::remove_dir_all(path).await
+}
+
+#[tokio::test]
+async fn replacement_preserves_slots_bounds_and_topology() -> io::Result<()> {
+    #[derive(Clone, Eq, PartialEq)]
+    struct Tens;
+
+    impl collate::Collate for Tens {
+        type Value = i16;
+
+        fn cmp(&self, left: &i16, right: &i16) -> std::cmp::Ordering {
+            (left / 10).cmp(&(right / 10))
+        }
+    }
+
+    for count in [1, 80] {
+        let path = setup_tmp_dir().await?;
+        let cache = Cache::<File>::new(1024 * 1024, None, 0, std::time::Duration::from_secs(1));
+        let dir = cache.load(path.clone())?;
+        let tree = BTreeLock::create(ExampleSchema::<i16>::new(1), Tens, dir.clone()).await?;
+        assert!(!tree.write().await.replace(&[0], vec![1]).await?);
+        tree.write()
+            .await
+            .insert_sorted(futures::stream::iter((0..count).map(|i| Ok(vec![10 * i]))))
+            .await?;
+
+        // Record physical nodes, all slots, and child identities, not just output.
+        let files: Vec<_> = dir.read().await.files().cloned().collect();
+        let mut before = Vec::new();
+        for file in &files {
+            before.push((*file.read::<Node<Vec<Vec<i16>>>>().await?).clone());
+        }
+        {
+            let mut write = tree.write().await;
+            assert!(!write.replace(&[count * 10], vec![count * 10 + 1]).await?);
+            assert!(!write.replace(&[1], vec![2]).await?);
+            assert_eq!(
+                write.replace(&[], vec![1]).await.unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(
+                write.replace(&[0], vec![]).await.unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            if count > 1 {
+                for replacement in [10, 11, count * 10] {
+                    assert_eq!(
+                        write
+                            .replace(&[0], vec![replacement])
+                            .await
+                            .unwrap_err()
+                            .kind(),
+                        io::ErrorKind::InvalidInput
+                    );
+                }
+            }
+            for i in 0..count {
+                assert!(write.replace(&[10 * i], vec![10 * i + 1]).await?);
+                assert!(write.replace(&[10 * i + 1], vec![10 * i + 1]).await?);
+            }
+        }
+        assert_eq!(dir.read().await.len(), files.len());
+        for (file, old) in files.iter().zip(&before) {
+            let node = file.read::<Node<Vec<Vec<i16>>>>().await?;
+            let (old_rows, rows) = match (old, &*node) {
+                (Node::Leaf(old), Node::Leaf(new)) => (old, new),
+                (Node::Index(old, old_children), Node::Index(new, new_children)) => {
+                    assert_eq!(old_children, new_children);
+                    (old, new)
+                }
+                _ => panic!("replacement changed node kind"),
+            };
+            assert_eq!(old_rows.len(), rows.len());
+            for (old, new) in old_rows.iter().zip(rows) {
+                assert_eq!(new, &vec![old[0] + 1]);
+            }
+        }
+        // Row capacity is retained memory even for fixed-width scalar values.
+        let mut grown = Vec::with_capacity(128);
+        grown.push(2);
+        assert!(tree.write().await.replace(&[1], grown).await?);
+        assert!(tree.write().await.replace(&[2], vec![1]).await?);
+        tree.validate().await?;
+        tree.sync_all().await?;
+        drop(files);
+        drop(tree);
+        drop(dir);
+        let reopened = Cache::<File>::new(1024 * 1024, None, 0, std::time::Duration::from_secs(1))
+            .load(path.clone())?;
+        let tree = BTreeLock::load(ExampleSchema::<i16>::new(1), Tens, reopened)?;
+        tree.validate().await?;
+        let actual: Vec<_> = tree
+            .read()
+            .await
+            .keys(Range::<i16>::default())
+            .await?
+            .map_ok(|row| row[0])
+            .try_collect()
+            .await?;
+        assert_eq!(actual, (0..count).map(|i| i * 10 + 1).collect::<Vec<_>>());
+        drop(tree);
+        fs::remove_dir_all(path).await?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn replacement_accounts_actual_retained_growth() -> io::Result<()> {
+    use uuid::Uuid;
+
+    let path = setup_tmp_dir().await?;
+    let node = Node::Leaf(vec![vec![0]]);
+    let initial = node.get_size();
+    let dir = Cache::<File>::new(initial + 2, None, 0, std::time::Duration::from_millis(30))
+        .load(path.clone())?;
+    dir.write()
+        .await
+        .create_file(Uuid::nil().to_string(), node)
+        .await?;
+    let tree = BTreeLock::load(
+        ExampleSchema::<i16>::new(1),
+        Collator::default(),
+        dir.clone(),
+    )?;
+    {
+        let mut write = tree.write().await;
+        let mut grown = Vec::with_capacity(2);
+        grown.push(1);
+        assert!(write.replace(&[0], grown).await?);
+        let mut grown = Vec::with_capacity(3);
+        grown.push(2);
+        assert!(write.replace(&[1], grown).await?);
+        assert_eq!(
+            write
+                .first(Range::<i16>::default())
+                .await?
+                .unwrap()
+                .as_slice(),
+            &[2]
+        );
+        assert!(write.replace(&[2], vec![0]).await?);
+    }
+    tree.validate().await?;
+    drop(tree);
+    drop(dir);
+    fs::remove_dir_all(path).await
+}
+
+#[tokio::test]
+async fn replacement_rejects_ambiguity_across_leaves() -> io::Result<()> {
+    use uuid::Uuid;
+
+    #[derive(Clone, Eq, PartialEq)]
+    struct Equal;
+
+    impl collate::Collate for Equal {
+        type Value = i16;
+
+        fn cmp(&self, _: &i16, _: &i16) -> std::cmp::Ordering {
+            std::cmp::Ordering::Equal
+        }
+    }
+
+    let path = setup_tmp_dir().await?;
+    let dir = Cache::<File>::new(1024 * 1024, None, 0, std::time::Duration::from_secs(1))
+        .load(path.clone())?;
+    let children = vec![Uuid::from_u128(1), Uuid::from_u128(2)];
+    let entries = [
+        (
+            Uuid::nil(),
+            Node::Index(vec![vec![0], vec![1]], children.clone()),
+        ),
+        (children[0], Node::Leaf(vec![vec![0]])),
+        (children[1], Node::Leaf(vec![vec![1]])),
+    ];
+    for (id, node) in entries {
+        dir.write().await.create_file(id.to_string(), node).await?;
+    }
+    let tree = BTreeLock::load(ExampleSchema::<i16>::new(1), Equal, dir.clone())?;
+    for previous in [0, 1, 2] {
+        assert_eq!(
+            tree.write()
+                .await
+                .replace(&[previous], vec![previous])
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    let rows: Vec<_> = tree
+        .read()
+        .await
+        .keys(Range::<i16>::default())
+        .await?
+        .map_ok(|row| row[0])
+        .try_collect()
+        .await?;
+    assert_eq!(rows, [0, 1]);
+    drop(tree);
+    drop(dir);
+    fs::remove_dir_all(path).await
+}
+
+#[tokio::test]
+async fn replacement_cancellation_releases_prepared_ancestors() -> io::Result<()> {
+    let path = setup_tmp_dir().await?;
+    let dir = Cache::<File>::new(1024 * 1024, None, 0, std::time::Duration::from_secs(1))
+        .load(path.clone())?;
+    let tree = BTreeLock::create(
+        ExampleSchema::<i16>::new(1),
+        Collator::default(),
+        dir.clone(),
+    )
+    .await?;
+    tree.write()
+        .await
+        .insert_sorted(futures::stream::iter((0..80).map(|i| Ok(vec![i * 10]))))
+        .await?;
+    let files: Vec<_> = dir.read().await.files().cloned().collect();
+    let root = dir
+        .read()
+        .await
+        .get_file(&uuid::Uuid::nil().to_string())
+        .unwrap()
+        .clone();
+    let mut pinned = None;
+    for file in &files {
+        let node = file.read_owned::<Node<Vec<Vec<i16>>>>().await?;
+        if matches!(&*node, Node::Leaf(rows) if rows[0] == vec![0]) {
+            pinned = Some(node);
+            break;
+        }
+    }
+    assert!(pinned.is_some());
+    {
+        let mut write = tree.write().await;
+        {
+            let mut pending = std::pin::pin!(write.replace(&[0], vec![1]));
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    assert!(futures::poll!(pending.as_mut()).is_pending());
+                    if root.try_read::<Node<Vec<Vec<i16>>>>().is_err() {
+                        break;
+                    }
+                    // Tokio may exhaust its cooperative budget during lookup,
+                    // before replacement has acquired any publication guard.
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("replacement reached the pinned leaf");
+        }
+        assert!(root.try_read::<Node<Vec<Vec<i16>>>>().is_ok());
+    }
+    drop(pinned);
+    assert_eq!(
+        tree.read()
+            .await
+            .first(Range::<i16>::default())
+            .await?
+            .unwrap()
+            .as_slice(),
+        &[0]
+    );
+    tree.validate().await?;
+    assert!(tree.write().await.replace(&[0], vec![1]).await?);
+    drop(files);
+    drop(root);
+    drop(tree);
+    drop(dir);
+    fs::remove_dir_all(path).await
 }
 
 #[tokio::test]
 async fn sorted_ingestion_matches_insertion_and_survives_errors() -> Result<(), io::Error> {
     use futures::{StreamExt, stream};
+
     let path = setup_tmp_dir().await?;
     let cache = Cache::<File>::new(1024 * 1024, None, 0, std::time::Duration::from_secs(3));
     let dir = cache.load(path.clone())?;
@@ -237,6 +573,41 @@ async fn sorted_ingestion_matches_insertion_and_survives_errors() -> Result<(), 
         .try_collect()
         .await?;
     assert_eq!(actual, (0..2002).collect::<Vec<_>>());
+
+    for (start, end) in [(0, 0), (3, 17), (1995, 2002), (2002, 2010)] {
+        for reverse in [false, true] {
+            let range = Range::with_range(vec![], start..end);
+            let reader = tree.read().await;
+            let keys = if reverse {
+                reader.keys_rev(range).await?
+            } else {
+                reader.keys(range).await?
+            };
+            let actual: Vec<_> = keys.map_ok(|key| key[0]).try_collect().await?;
+            let mut expected: Vec<_> = (start..end.min(2002)).collect();
+            if reverse {
+                expected.reverse();
+            }
+
+            assert_eq!(actual, expected);
+        }
+    }
+
+    // A partially consumed stream owns its guard; dropping it releases the writer.
+    for reverse in [false, true] {
+        let reader = tree.read().await;
+        let mut keys = if reverse {
+            reader.keys_rev(Range::<i16>::default()).await?
+        } else {
+            reader.keys(Range::<i16>::default()).await?
+        };
+        assert!(keys.try_next().await?.is_some());
+        assert!(tree.try_write().is_err());
+
+        drop(keys);
+        drop(tree.try_write()?);
+    }
+
     {
         let mut write = tree.write().await;
         for key in (0..2002).step_by(2) {
@@ -306,11 +677,7 @@ async fn duplicate_insertion_needs_no_growth_admission() -> io::Result<()> {
         let cache = Cache::<File>::new(retained, None, 0, std::time::Duration::from_secs(1));
         let dir = cache.clone().load(path.clone())?;
         for (id, node) in entries {
-            let bound = node.get_size();
-            dir.write()
-                .await
-                .create_file(id.to_string(), node, bound)
-                .await?;
+            dir.write().await.create_file(id.to_string(), node).await?;
         }
         let tree = BTreeLock::load(
             ExampleSchema::<i16>::new(1),
@@ -327,22 +694,16 @@ async fn duplicate_insertion_needs_no_growth_admission() -> io::Result<()> {
                 duplicate.push(i);
                 assert!(!write.insert(duplicate).await?);
             }
+            let mut unchanged = Vec::with_capacity(1_000_000);
+            unchanged.push(0);
+            assert!(write.replace(&[0], unchanged).await?);
+            // The collator value changes, but the first row keeps its position
+            // before its successor. Replacement does not require collation equality.
+            assert!(write.replace(&[0], vec![-1]).await?);
+            assert!(write.replace(&[-1], vec![0]).await?);
             let mut duplicate = Vec::with_capacity(1_000_000);
             duplicate.push(count - 1);
             assert_eq!(write.insert_sorted(stream::iter([Ok(duplicate)])).await?, 0);
-            for ordered in [false, true] {
-                let mut growth = Vec::with_capacity(1_000_000);
-                growth.push(count);
-                let error = if ordered {
-                    write
-                        .insert_sorted(stream::iter([Ok(growth)]))
-                        .await
-                        .unwrap_err()
-                } else {
-                    write.insert(growth).await.unwrap_err()
-                };
-                assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
-            }
             assert_eq!(write.count(&Range::<i16>::default()).await?, count as u64);
             assert!(!write.contains(&[count]).await?);
         }
@@ -370,6 +731,7 @@ async fn duplicate_insertion_needs_no_growth_admission() -> io::Result<()> {
         drop(tree);
         fs::remove_dir_all(path).await?;
     }
+
     Ok(())
 }
 
@@ -450,10 +812,8 @@ async fn in_place_splits_merges_copy_and_reopening() -> Result<(), io::Error> {
     {
         let contents = copy_dir.write().await;
         let malformed = Node::Index(vec![vec![90]], vec![root]);
-        let bound = std::mem::size_of::<File>() + malformed.get_size();
-        *contents
-            .write_file::<_, Node<Vec<Vec<i16>>>>(&root, bound)
-            .await? = malformed;
+
+        *contents.write_file::<_, Node<Vec<Vec<i16>>>>(&root).await? = malformed;
     }
     assert!(copy.validate().await.is_err());
     reopened.write().await.create_dir("unexpected".into())?;
@@ -490,6 +850,7 @@ async fn lookup_between_index_bounds_uses_the_preceding_child() -> Result<(), io
             assert_eq!(first.map(|row| row[0]), (key % 2 == 0).then_some(key));
         }
     }
+
     fs::remove_dir_all(path).await
 }
 

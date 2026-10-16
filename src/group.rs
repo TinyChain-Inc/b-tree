@@ -1,10 +1,10 @@
-use collate::Collate;
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
+use collate::Collate;
 use futures::stream::{Fuse, Stream, StreamExt};
 use pin_project::pin_project;
 
