@@ -704,6 +704,8 @@ async fn duplicate_insertion_needs_no_growth_admission() -> io::Result<()> {
             let mut unchanged = Vec::with_capacity(1_000_000);
             unchanged.push(0);
             assert!(write.replace(&[0], unchanged).await?);
+            // The collator value changes, but the first row keeps its position
+            // before its successor. Replacement does not require collation equality.
             assert!(write.replace(&[0], vec![-1]).await?);
             assert!(write.replace(&[-1], vec![0]).await?);
             let mut replacement = Vec::with_capacity(1_000_000);

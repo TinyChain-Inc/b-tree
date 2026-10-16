@@ -46,6 +46,13 @@ but distinct values can change position during a split.
 `BTreeWriteGuard::replace` changes one exact row in place, including affected
 first-row copies in index nodes. It rejects collator-equivalent ambiguity and
 changes that would cross or collide with a neighbor; it never deletes/reinserts.
+A replacement may compare differently from its previous value, provided it remains
+strictly between its actual predecessor and successor. This public operation is
+safe to call directly; callers need no additional ordering guard.
 Input checks and retained-size admission complete before synchronous publication,
 so rejection or cancellation before publication leaves row contents unchanged.
 This is not a durability or cross-index atomicity guarantee.
+
+The private `tree` modules separate reads/traversal, insertion, deletion,
+replacement, and stream decoding. The module root owns public handles and shared
+node admission; operation-specific helpers remain with their operation.
