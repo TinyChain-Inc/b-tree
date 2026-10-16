@@ -9,7 +9,7 @@ use futures::{TryFutureExt, TryStreamExt};
 #[cfg(test)]
 use get_size::GetSize;
 use rand::RngExt;
-use safecast::as_type;
+use safecast::AsType;
 use smallvec::smallvec;
 use tokio::fs;
 
@@ -178,6 +178,7 @@ async fn sorted_ingestion_retains_last_input_across_equal_collator_splits() -> i
         type Value = i16;
 
         fn cmp(&self, _: &i16, _: &i16) -> std::cmp::Ordering {
+            let _ = COLLATIONS.try_with(|count| count.set(count.get() + 1));
             std::cmp::Ordering::Equal
         }
     }
@@ -187,7 +188,7 @@ async fn sorted_ingestion_retains_last_input_across_equal_collator_splits() -> i
     let dir = cache.load(path.clone())?;
     let schema = ExampleSchema::<i16>::new(1);
     let order = schema.order() as i16;
-    let tree = BTreeLock::create(schema, Equal, dir).await?;
+    let tree = BTreeLock::create(schema, Equal, dir.clone()).await?;
     let keys = (0..=order).chain([order]).map(|i| Ok(vec![i]));
 
     assert_eq!(
@@ -208,19 +209,85 @@ async fn sorted_ingestion_retains_last_input_across_equal_collator_splits() -> i
         .await?;
     actual.sort();
     assert_eq!(actual, (0..=order).collect::<Vec<_>>());
-    for previous in [0, order, order + 1] {
-        let error = tree
-            .write()
-            .await
-            .replace(&[previous], vec![100])
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    for key in 0..=order {
+        assert!(tree.read().await.contains(&[key]).await?);
+        assert!(!tree.write().await.insert(vec![key]).await?);
     }
     assert_eq!(
-        tree.read().await.count(&Range::<i16>::default()).await?,
-        (order + 1) as u64
+        tree.write()
+            .await
+            .insert_sorted(futures::stream::iter([Ok(vec![0]), Ok(vec![order])]))
+            .await?,
+        0
     );
+    assert!(tree.write().await.replace(&[0], vec![100]).await?);
+    assert!(!tree.write().await.replace(&[order + 1], vec![101]).await?);
+    assert_eq!(
+        tree.write()
+            .await
+            .replace(&[100], vec![order])
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    for key in order + 1..40 {
+        assert!(tree.write().await.insert(vec![key]).await?);
+    }
+    tree.validate().await?;
+
+    let mut leaves = 0;
+    {
+        let dir = dir.read().await;
+        for (name, _) in dir.iter() {
+            let file = dir.get_file(name).unwrap();
+            if matches!(&*file.read::<Node<Vec<Vec<i16>>>>().await?, Node::Leaf(_)) {
+                leaves += 1;
+            }
+        }
+    }
+
+    let lookup_comparisons = COLLATIONS
+        .scope(std::cell::Cell::new(0), async {
+            LEAF_READS
+                .scope(std::cell::Cell::new(0), async {
+                    assert_eq!(tree.read().await.get(&[20]).await?, Some(smallvec![20]));
+                    assert_eq!(
+                        LEAF_READS.with(std::cell::Cell::get),
+                        leaves,
+                        "each leaf is acquired once"
+                    );
+                    Ok::<_, io::Error>(COLLATIONS.with(std::cell::Cell::get))
+                })
+                .await
+        })
+        .await?;
+
+    COLLATIONS
+        .scope(std::cell::Cell::new(0), async {
+            assert!(tree.write().await.replace(&[20], vec![20]).await?);
+            assert_eq!(
+                COLLATIONS.with(std::cell::Cell::get),
+                lookup_comparisons + 2,
+                "one group scan and two neighbor comparisons"
+            );
+            Ok::<_, io::Error>(())
+        })
+        .await?;
+
+    // Absent-target behavior wins even if the supplied replacement would collide.
+    assert!(!tree.write().await.replace(&[101], vec![20]).await?);
+    tree.sync_all().await?;
+    drop(tree);
+    let dir = Cache::<File>::new(1024 * 1024, None, 0, std::time::Duration::from_secs(1))
+        .load(path.clone())?;
+    let tree = BTreeLock::load(ExampleSchema::<i16>::new(1), Equal, dir)?;
+    tree.validate().await?;
+    for key in (1..40).chain([100]) {
+        assert!(tree.read().await.contains(&[key]).await?, "missing {key}");
+        assert!(tree.write().await.delete(&[key]).await?, "delete {key}");
+    }
+    assert_eq!(tree.read().await.count(&Range::<i16>::default()).await?, 0);
 
     drop(tree);
     fs::remove_dir_all(path).await
@@ -269,7 +336,7 @@ async fn replacement_preserves_slots_bounds_and_topology() -> io::Result<()> {
                 io::ErrorKind::InvalidInput
             );
             if count > 1 {
-                for replacement in [10, 11, count * 10] {
+                for replacement in [10, 20, count * 10] {
                     assert_eq!(
                         write
                             .replace(&[0], vec![replacement])
@@ -374,7 +441,7 @@ async fn replacement_accounts_actual_retained_growth() -> io::Result<()> {
 }
 
 #[tokio::test]
-async fn replacement_rejects_ambiguity_across_leaves() -> io::Result<()> {
+async fn replacement_distinguishes_equivalent_rows_across_leaves() -> io::Result<()> {
     use uuid::Uuid;
 
     #[derive(Clone, Eq, PartialEq)]
@@ -404,17 +471,25 @@ async fn replacement_rejects_ambiguity_across_leaves() -> io::Result<()> {
         dir.write().await.create_file(id.to_string(), node).await?;
     }
     let tree = BTreeLock::load(ExampleSchema::<i16>::new(1), Equal, dir.clone())?;
-    for previous in [0, 1, 2] {
-        assert_eq!(
+    for previous in [0, 1] {
+        assert!(
             tree.write()
                 .await
                 .replace(&[previous], vec![previous])
-                .await
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
+                .await?
         );
     }
+    assert!(!tree.write().await.replace(&[2], vec![2]).await?);
+    assert!(tree.write().await.replace(&[0], vec![2]).await?);
+    assert_eq!(
+        tree.write()
+            .await
+            .replace(&[1], vec![2])
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
     let rows: Vec<_> = tree
         .read()
         .await
@@ -423,7 +498,7 @@ async fn replacement_rejects_ambiguity_across_leaves() -> io::Result<()> {
         .map_ok(|row| row[0])
         .try_collect()
         .await?;
-    assert_eq!(rows, [0, 1]);
+    assert_eq!(rows, [2, 1]);
     drop(tree);
     drop(dir);
     fs::remove_dir_all(path).await
@@ -694,9 +769,9 @@ async fn duplicate_insertion_needs_no_growth_admission() -> io::Result<()> {
                 duplicate.push(i);
                 assert!(!write.insert(duplicate).await?);
             }
-            let mut unchanged = Vec::with_capacity(1_000_000);
-            unchanged.push(0);
-            assert!(write.replace(&[0], unchanged).await?);
+            // Replacement always publishes the supplied row; only insertion
+            // duplicates retain the old allocation without mutation.
+            assert!(write.replace(&[0], vec![0]).await?);
             // The collator value changes, but the first row keeps its position
             // before its successor. Replacement does not require collation equality.
             assert!(write.replace(&[0], vec![-1]).await?);
@@ -916,7 +991,42 @@ impl<'en> en::ToStream<'en> for File {
     }
 }
 
-as_type!(File, Node, Node<Vec<Vec<i16>>>);
+// Test-only observation counters, excluded from non-test builds. Each test
+// scopes its own task-local values so concurrent tests do not share state.
+#[cfg(test)]
+tokio::task_local! {
+    static LEAF_READS: std::cell::Cell<usize>;
+    static COLLATIONS: std::cell::Cell<usize>;
+}
+
+impl From<Node<Vec<Vec<i16>>>> for File {
+    fn from(node: Node<Vec<Vec<i16>>>) -> Self {
+        Self::Node(node)
+    }
+}
+
+impl AsType<Node<Vec<Vec<i16>>>> for File {
+    fn as_type(&self) -> Option<&Node<Vec<Vec<i16>>>> {
+        let Self::Node(node) = self;
+
+        #[cfg(test)]
+        if matches!(node, Node::Leaf(_)) {
+            let _ = LEAF_READS.try_with(|reads| reads.set(reads.get() + 1));
+        }
+
+        Some(node)
+    }
+
+    fn as_type_mut(&mut self) -> Option<&mut Node<Vec<Vec<i16>>>> {
+        let Self::Node(node) = self;
+        Some(node)
+    }
+
+    fn into_type(self) -> Option<Node<Vec<Vec<i16>>>> {
+        let Self::Node(node) = self;
+        Some(node)
+    }
+}
 
 #[derive(Debug)]
 struct ExampleSchema<T> {

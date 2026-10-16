@@ -31,35 +31,171 @@ where
     G: DirDeref<Entry = FE>,
     Node<S::Value>: fmt::Debug,
 {
-    /// Return `true` if this B+Tree contains the given `key`.
+    /// Return whether the complete semantic key is present, independently of collation ties.
     pub async fn contains(&self, key: &[S::Value]) -> Result<bool, io::Error> {
-        let mut node = self.dir.as_dir().read_file(&ROOT).await?;
+        if key.len() != self.schema.len() {
+            return Ok(false);
+        }
+        Ok(self.locate(key).await?.1)
+    }
+
+    /// Return the unique row with this semantic prefix, or an ambiguity error.
+    /// Collation-equivalent but unequal prefixes do not match.
+    pub async fn get(&self, prefix: &[S::Value]) -> Result<Option<Key<S::Value>>, io::Error> {
+        let mut found = None;
+        self.visit_equivalent(prefix, |_, row| {
+            if row.starts_with(prefix) {
+                if found.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "ambiguous semantic key",
+                    ));
+                }
+                found = Some(stack_key(row));
+            }
+            Ok(false)
+        })
+        .await?;
+        Ok(found)
+    }
+
+    pub(super) async fn locate<V: Borrow<S::Value>>(
+        &self,
+        key: &[V],
+    ) -> Result<(Vec<(Uuid, usize)>, bool), io::Error> {
+        let mut found = false;
+        let path = self
+            .visit_equivalent(key, |_, row| {
+                found = row.len() >= key.len() && row.iter().zip(key).all(|(a, b)| a == b.borrow());
+                Ok(found)
+            })
+            .await?;
+        Ok((path, found))
+    }
+
+    // Keep only one root-to-leaf path and one borrowed node. The returned slot
+    // is also an insertion position when no matching value is found.
+    pub(super) async fn visit_equivalent<V: Borrow<S::Value>>(
+        &self,
+        key: &[V],
+        mut visit: impl FnMut(&[(Uuid, usize)], &[S::Value]) -> Result<bool, io::Error>,
+    ) -> Result<Vec<(Uuid, usize)>, io::Error> {
+        let mut path = Vec::new();
+        let mut id = ROOT;
+        let mut node = loop {
+            let node = self.dir.as_dir().read_file(&id).await?;
+
+            match &*node {
+                Node::Index(bounds, children) => {
+                    if bounds.is_empty() || bounds.len() != children.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid index node",
+                        ));
+                    }
+
+                    let slot = bounds.bisect_left(key, &self.collator).saturating_sub(1);
+                    path.push((id, slot));
+                    id = children[slot];
+                }
+                Node::Leaf(rows) => {
+                    path.push((id, rows.bisect_left(key, &self.collator)));
+                    break node;
+                }
+            }
+        };
 
         loop {
-            match &*node {
-                Node::Leaf(keys) => {
-                    let i = keys.bisect_left(key, &self.collator);
+            let start = path.last().expect("leaf path").1;
+            let Node::Leaf(rows) = &*node else {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "expected leaf"));
+            };
 
-                    break Ok(if i < keys.len() {
-                        match keys.get(i) {
-                            Some(present) => present == key,
-                            _ => false,
-                        }
-                    } else {
-                        false
-                    });
+            for (slot, row) in rows.iter().enumerate().skip(start) {
+                path.last_mut().expect("leaf path").1 = slot;
+                if !self.collator.cmp_slices(row, key).is_eq() || visit(&path, row)? {
+                    return Ok(path);
                 }
-                Node::Index(bounds, children) => {
-                    let i = bounds.bisect_right(key, &self.collator);
+            }
 
-                    if i == 0 {
-                        return Ok(false);
-                    } else {
-                        node = self.dir.as_dir().read_file(&children[i - 1]).await?;
+            path.last_mut().expect("leaf path").1 = rows.len();
+            drop(node);
+
+            match self.adjacent_leaf(&mut path, true).await? {
+                Some(next) => node = next,
+                None => return Ok(path),
+            }
+        }
+    }
+
+    // Retain the full leaf path when there is no neighbor, including its insertion
+    // position. Return the acquired leaf so callers need not release and reread it.
+    pub(super) async fn adjacent_leaf<'a>(
+        &'a self,
+        path: &mut Vec<(Uuid, usize)>,
+        forward: bool,
+    ) -> io::Result<Option<FileReadGuard<'a, Node<S::Value>>>> {
+        for level in (0..path.len().saturating_sub(1)).rev() {
+            let (id, slot) = path[level];
+            let node = self.dir.as_dir().read_file(&id).await?;
+            let Node::Index(rows, children) = &*node else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expected index ancestor",
+                ));
+            };
+
+            if rows.is_empty() || rows.len() != children.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid index node",
+                ));
+            }
+
+            let next = if forward {
+                slot.checked_add(1).filter(|i| *i < rows.len())
+            } else {
+                slot.checked_sub(1)
+            };
+            let Some(next) = next else { continue };
+
+            path.truncate(level);
+            path.push((id, next));
+            let mut child = children[next];
+            drop(node);
+
+            loop {
+                let node = self.dir.as_dir().read_file(&child).await?;
+
+                match &*node {
+                    Node::Leaf(rows) => {
+                        if rows.is_empty() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "empty non-root leaf",
+                            ));
+                        }
+
+                        path.push((child, if forward { 0 } else { rows.len() - 1 }));
+                        return Ok(Some(node));
+                    }
+                    Node::Index(rows, children) => {
+                        if rows.is_empty() || rows.len() != children.len() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid index node",
+                            ));
+                        }
+
+                        let slot = if forward { 0 } else { rows.len() - 1 };
+                        path.push((child, slot));
+                        child = children[slot];
                     }
                 }
             }
         }
+
+        Ok(None)
     }
 
     /// Count how many keys lie within the given `range` of this B+Tree.
