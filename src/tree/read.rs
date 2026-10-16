@@ -82,8 +82,9 @@ where
     ) -> Result<Vec<(Uuid, usize)>, io::Error> {
         let mut path = Vec::new();
         let mut id = ROOT;
-        loop {
+        let mut node = loop {
             let node = self.dir.as_dir().read_file(&id).await?;
+
             match &*node {
                 Node::Index(bounds, children) => {
                     if bounds.is_empty() || bounds.len() != children.len() {
@@ -92,47 +93,50 @@ where
                             "invalid index node",
                         ));
                     }
+
                     let slot = bounds.bisect_left(key, &self.collator).saturating_sub(1);
                     path.push((id, slot));
                     id = children[slot];
                 }
                 Node::Leaf(rows) => {
                     path.push((id, rows.bisect_left(key, &self.collator)));
-                    break;
+                    break node;
                 }
             }
-        }
+        };
 
         loop {
-            let &(id, start) = path.last().expect("leaf path");
-            let node = self.dir.as_dir().read_file(&id).await?;
+            let start = path.last().expect("leaf path").1;
             let Node::Leaf(rows) = &*node else {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "expected leaf"));
             };
+
             for (slot, row) in rows.iter().enumerate().skip(start) {
                 path.last_mut().expect("leaf path").1 = slot;
                 if !self.collator.cmp_slices(row, key).is_eq() || visit(&path, row)? {
                     return Ok(path);
                 }
             }
+
             path.last_mut().expect("leaf path").1 = rows.len();
             drop(node);
-            let last = path.clone();
-            path.pop();
-            if !self.adjacent_slot(&mut path, true).await? {
-                return Ok(last);
+
+            match self.adjacent_leaf(&mut path, true).await? {
+                Some(next) => node = next,
+                None => return Ok(path),
             }
         }
     }
 
-    // Find an adjacent leaf from the current leaf's ancestors. Guards are
-    // released before entering another node or acquiring publication guards.
-    pub(super) async fn adjacent_slot(
-        &self,
+    // Retain the full leaf path when there is no neighbor, including its insertion
+    // position. Return the acquired leaf so callers need not release and reread it.
+    pub(super) async fn adjacent_leaf<'a>(
+        &'a self,
         path: &mut Vec<(Uuid, usize)>,
         forward: bool,
-    ) -> io::Result<bool> {
-        while let Some((id, slot)) = path.pop() {
+    ) -> io::Result<Option<FileReadGuard<'a, Node<S::Value>>>> {
+        for level in (0..path.len().saturating_sub(1)).rev() {
+            let (id, slot) = path[level];
             let node = self.dir.as_dir().read_file(&id).await?;
             let Node::Index(rows, children) = &*node else {
                 return Err(io::Error::new(
@@ -155,12 +159,14 @@ where
             };
             let Some(next) = next else { continue };
 
+            path.truncate(level);
             path.push((id, next));
             let mut child = children[next];
             drop(node);
 
             loop {
                 let node = self.dir.as_dir().read_file(&child).await?;
+
                 match &*node {
                     Node::Leaf(rows) => {
                         if rows.is_empty() {
@@ -171,7 +177,7 @@ where
                         }
 
                         path.push((child, if forward { 0 } else { rows.len() - 1 }));
-                        return Ok(true);
+                        return Ok(Some(node));
                     }
                     Node::Index(rows, children) => {
                         if rows.is_empty() || rows.len() != children.len() {
@@ -189,7 +195,7 @@ where
             }
         }
 
-        Ok(false)
+        Ok(None)
     }
 
     /// Count how many keys lie within the given `range` of this B+Tree.

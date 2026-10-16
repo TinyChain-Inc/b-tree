@@ -15,11 +15,14 @@ where
     FE: AsType<Node<S::Value>> + Send + Sync + FileLoad,
 {
     /// Replace an exact row without changing its position or the tree topology.
+    ///
     /// The replacement must remain between the actual predecessor and
     /// successor, including across leaf boundaries. It need not compare equal to
     /// the previous row. Returns false when the previous row is absent.
-    /// Distinct collator-equivalent rows are allowed. Value collisions and relocation are rejected
-    /// before any row contents change.
+    ///
+    /// Distinct collator-equivalent rows are allowed. Value collisions and
+    /// relocation are rejected before any row contents change.
+    ///
     /// All validation and guard acquisition precede the synchronous publication;
     /// this does not provide durability or atomicity across multiple indexes.
     pub async fn replace(
@@ -36,60 +39,85 @@ where
 
         let replacement = validate_key(&*self.schema, replacement)?;
 
+        // Search the replacement group for both identities. This avoids comparing
+        // two potentially large rows merely to decide whether they share a group.
         let mut target = None;
-        self.visit_equivalent(previous, |path, row| {
-            if row == previous {
-                if target.is_some() {
+        let replacement_check = self
+            .visit_equivalent(&replacement, |path, row| {
+                if row == previous {
+                    if target.is_some() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "duplicate semantic row",
+                        ));
+                    }
+
+                    target = Some(path.to_vec());
+                } else if row == replacement {
                     return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "duplicate semantic row",
+                        io::ErrorKind::InvalidInput,
+                        "replacement collides with an existing value",
                     ));
                 }
-                target = Some(path.to_vec());
-            }
-            Ok(false)
-        })
-        .await?;
-        let Some(path) = target else { return Ok(false) };
 
-        self.visit_equivalent(&replacement, |candidate, row| {
-            if candidate != path && row == replacement {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "replacement collides with an existing value",
-                ));
-            }
-            Ok(false)
-        })
-        .await?;
+                Ok(false)
+            })
+            .await;
+
+        // Distinct groups require a second search. Resolve the previous row before
+        // reporting replacement errors, preserving absent and ambiguous-target behavior.
+        if target.is_none() || replacement_check.is_err() {
+            target = None;
+            self.visit_equivalent(previous, |path, row| {
+                if row == previous {
+                    if target.is_some() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "duplicate semantic row",
+                        ));
+                    }
+
+                    target = Some(path.to_vec());
+                }
+
+                Ok(false)
+            })
+            .await?;
+        }
+
+        let Some(path) = target else { return Ok(false) };
+        replacement_check?;
 
         let &(id, slot) = path.last().expect("leaf path");
-        for forward in [false, true] {
-            let mut neighbor = path.clone();
-            let node = self.dir.read_file(&id).await?;
-            let Node::Leaf(rows) = &*node else {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "expected leaf"));
-            };
-            let next = if forward {
-                slot.checked_add(1).filter(|&i| i < rows.len())
-            } else {
-                slot.checked_sub(1)
-            };
-            let order = if let Some(next) = next {
-                self.collator.cmp_slices(&replacement, &rows[next])
-            } else {
-                drop(node);
-                neighbor.pop();
-                if !self.adjacent_slot(&mut neighbor, forward).await? {
-                    continue;
+        let node = self.dir.read_file(&id).await?;
+        let Node::Leaf(rows) = &*node else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "expected leaf"));
+        };
+
+        let local = [
+            slot.checked_sub(1),
+            slot.checked_add(1).filter(|&i| i < rows.len()),
+        ]
+        .map(|next| next.map(|i| self.collator.cmp_slices(&replacement, &rows[i])));
+        drop(node);
+
+        for (forward, order) in [false, true].into_iter().zip(local) {
+            let order = match order {
+                Some(order) => order,
+                None => {
+                    let mut neighbor = path.clone();
+                    let Some(node) = self.adjacent_leaf(&mut neighbor, forward).await? else {
+                        continue;
+                    };
+                    let Node::Leaf(rows) = &*node else {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "expected leaf"));
+                    };
+
+                    let slot = neighbor.last().expect("neighbor path").1;
+                    self.collator.cmp_slices(&replacement, &rows[slot])
                 }
-                let &(id, slot) = neighbor.last().expect("neighbor path");
-                let node = self.dir.read_file(&id).await?;
-                let Node::Leaf(rows) = &*node else {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "expected leaf"));
-                };
-                self.collator.cmp_slices(&replacement, &rows[slot])
             };
+
             if if forward {
                 order.is_gt()
             } else {
@@ -118,6 +146,7 @@ where
             let rows = match &*node {
                 Node::Leaf(rows) | Node::Index(rows, _) => rows,
             };
+
             rows.get(slot)
                 .filter(|row| row.as_slice() == previous)
                 .ok_or_else(|| {
