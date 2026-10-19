@@ -18,7 +18,6 @@ use crate::group::GroupBy;
 use crate::node::Block;
 use crate::range::Range;
 
-type NodeStack<V> = SmallVec<[Key<V>; NODE_STACK_SIZE]>;
 type Nodes<FE, V> = Pin<Box<dyn Stream<Item = Result<Leaf<FE, V>, io::Error>> + Send>>;
 type ResultNodes<FE, V> = Result<Nodes<FE, V>, io::Error>;
 
@@ -368,7 +367,9 @@ where
 
         let keys = nodes
             .map_ok(move |leaf| {
-                let mut keys = NodeStack::with_capacity(leaf.as_ref().len());
+                // Rows already contain inline key storage; keep the outer batch on the
+                // heap to avoid oversized temporaries when polling stream combinators.
+                let mut keys: Vec<Key<S::Value>> = Vec::with_capacity(leaf.as_ref().len());
 
                 for key in leaf.as_ref() {
                     keys.push(key.iter().cloned().collect())
@@ -390,7 +391,9 @@ where
 
         let keys = nodes
             .map_ok(|leaf| {
-                let mut keys = NodeStack::with_capacity(leaf.as_ref().len());
+                // Rows already contain inline key storage; keep the outer batch on the
+                // heap to avoid oversized temporaries when polling stream combinators.
+                let mut keys: Vec<Key<S::Value>> = Vec::with_capacity(leaf.as_ref().len());
 
                 for key in leaf.as_ref().iter().rev() {
                     keys.push(key.iter().cloned().collect());
