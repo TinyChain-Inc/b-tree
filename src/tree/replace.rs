@@ -6,7 +6,7 @@ use collate::Collate;
 use freqfs::{DirWriteGuardOwned, FileLoad};
 use safecast::AsType;
 
-use super::{BTree, Node, Schema, validate_key};
+use super::{BTree, Node, Schema, validate_children, validate_key};
 
 impl<S, C, FE> BTree<S, C, DirWriteGuardOwned<FE>>
 where
@@ -22,6 +22,10 @@ where
     ///
     /// Distinct collator-equivalent rows are allowed. Value collisions and
     /// relocation are rejected before any row contents change.
+    ///
+    /// The supplied row is published even when semantically equal to the old row.
+    /// Only routing separators crossed by the replacement are updated; no
+    /// delete/reinsert or additional caller-side ordering guard is needed.
     ///
     /// All validation and guard acquisition precede the synchronous publication;
     /// this does not provide durability or atomicity across multiple indexes.
@@ -94,6 +98,13 @@ where
             return Err(io::Error::new(io::ErrorKind::InvalidData, "expected leaf"));
         };
 
+        if rows.get(slot).is_none_or(|row| row.as_slice() != previous) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "replacement target changed",
+            ));
+        }
+
         let local = [
             slot.checked_sub(1),
             slot.checked_add(1).filter(|&i| i < rows.len()),
@@ -101,21 +112,84 @@ where
         .map(|next| next.map(|i| self.collator.cmp_slices(&replacement, &rows[i])));
         drop(node);
 
-        for (forward, order) in [false, true].into_iter().zip(local) {
-            let order = match order {
-                Some(order) => order,
-                None => {
-                    let mut neighbor = path.clone();
-                    let Some(node) = self.adjacent_leaf(&mut neighbor, forward).await? else {
-                        continue;
-                    };
-                    let Node::Leaf(rows) = &*node else {
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, "expected leaf"));
-                    };
+        // Only a changed leaf extreme can cross a routing fence. At most two
+        // ancestor separators need preparation, regardless of tree height.
+        let mut boundaries = Vec::with_capacity(2);
+        for (forward, local) in [false, true].into_iter().zip(local) {
+            let order = if let Some(order) = local {
+                order
+            } else {
+                let mut neighbor_path = path.clone();
+                let Some(neighbor) = self.adjacent_leaf(&mut neighbor_path, forward).await? else {
+                    continue;
+                };
+                let Node::Leaf(rows) = &*neighbor else {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "expected leaf"));
+                };
 
-                    let slot = neighbor.last().expect("neighbor path").1;
-                    self.collator.cmp_slices(&replacement, &rows[slot])
+                let neighbor_slot = neighbor_path.last().expect("neighbor path").1;
+                let neighbor_row = &rows[neighbor_slot];
+                let order = self.collator.cmp_slices(&replacement, neighbor_row);
+
+                if if forward {
+                    order.is_gt()
+                } else {
+                    order.is_lt()
+                } {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "replacement must remain between its neighbors",
+                    ));
                 }
+
+                let level = path
+                    .iter()
+                    .zip(&neighbor_path)
+                    .position(|(target, neighbor)| target.1 != neighbor.1)
+                    .expect("adjacent subtree divergence");
+                let boundary = path[level].1.min(neighbor_path[level].1);
+                let ancestor = self.dir.read_file(&path[level].0).await?;
+                let Node::Index(separators, children) = &*ancestor else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "expected index ancestor",
+                    ));
+                };
+
+                validate_children(separators, children)?;
+                let fence = separators.get(boundary).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "missing replacement separator")
+                })?;
+                let previous_order = self.collator.cmp_fences(previous, fence);
+                let neighbor_order = self.collator.cmp_fences(neighbor_row, fence);
+
+                if if forward {
+                    previous_order.is_gt() || neighbor_order.is_lt()
+                } else {
+                    previous_order.is_lt() || neighbor_order.is_gt()
+                } {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid replacement separator",
+                    ));
+                }
+
+                let crosses = self.collator.cmp_fences(&replacement, fence);
+
+                if if forward {
+                    crosses.is_gt()
+                } else {
+                    crosses.is_lt()
+                } {
+                    let updated = if forward {
+                        self.collator.separator(&replacement, neighbor_row)
+                    } else {
+                        self.collator.separator(neighbor_row, &replacement)
+                    };
+                    boundaries.push((level, boundary, fence.clone(), updated));
+                }
+
+                order
             };
 
             if if forward {
@@ -130,43 +204,66 @@ where
             }
         }
 
-        // Only a changed first row propagates upward. Include the first nonzero
-        // parent slot, whose own first row remains unchanged.
-        let mut first = path.len() - 1;
-        while first > 0 && path[first].1 == 0 {
-            first -= 1;
-        }
+        // Acquire affected ancestors once, root-to-leaf, then the leaf. All
+        // separator validation and allocation precede synchronous publication.
+        boundaries.sort_unstable_by_key(|&(level, _, _, _)| level);
+        let mut boundaries = boundaries.into_iter().peekable();
+        let mut prepared = Vec::with_capacity(2);
 
-        let affected = &path[first..];
-        let copies = std::iter::repeat_n(replacement, affected.len());
-
-        let mut prepared = Vec::with_capacity(affected.len());
-        for (&(id, slot), row) in affected.iter().zip(copies) {
-            let node = self.write_node(&id).await?;
-            let rows = match &*node {
-                Node::Leaf(rows) | Node::Index(rows, _) => rows,
+        while let Some(&(level, _, _, _)) = boundaries.peek() {
+            let node = self.write_node(&path[level].0).await?;
+            let Node::Index(separators, children) = &*node else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expected index ancestor",
+                ));
             };
 
-            rows.get(slot)
-                .filter(|row| row.as_slice() == previous)
-                .ok_or_else(|| {
-                    io::Error::new(
+            validate_children(separators, children)?;
+            let mut changes = Vec::with_capacity(2);
+            while boundaries
+                .peek()
+                .is_some_and(|&(next, _, _, _)| next == level)
+            {
+                let (_, slot, previous, replacement) =
+                    boundaries.next().expect("prepared separator");
+                if separators.get(slot) != Some(&previous) {
+                    return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "replacement bound is inconsistent with its leaf",
-                    )
-                })?;
+                        "replacement separator changed",
+                    ));
+                }
+                changes.push((slot, replacement));
+            }
 
-            prepared.push((node, slot, row));
+            prepared.push((node, changes));
+        }
+
+        let mut leaf = self.write_node(&id).await?;
+        let Node::Leaf(rows) = &mut *leaf else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "expected leaf"));
+        };
+
+        if rows.get(slot).is_none_or(|row| row.as_slice() != previous) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "replacement target changed",
+            ));
         }
 
         // No await or fallible work after the first swap. The directory write
-        // owner excludes readers until every affected first-row copy is updated.
-        for (mut node, slot, row) in prepared {
-            let rows = match &mut *node {
-                Node::Leaf(rows) | Node::Index(rows, _) => rows,
+        // owner excludes readers until all affected routing fences are updated.
+        for (mut node, changes) in prepared {
+            let Node::Index(separators, _) = &mut *node else {
+                unreachable!("validated index ancestor")
             };
-            rows[slot] = row;
+
+            for (slot, replacement) in changes {
+                separators[slot] = replacement;
+            }
         }
+
+        rows[slot] = replacement;
 
         Ok(true)
     }
