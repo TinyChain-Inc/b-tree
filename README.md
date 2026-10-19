@@ -7,7 +7,7 @@ for its root, and `BTreeLock::load` for an existing tree. Loading never creates 
 missing root. Synchronize a newly created tree before relying on reopening it
 after a restart.
 
-Run `cargo test --all-targets --all-features` to include the strict-load example test.
+Run `cargo test --all-targets --all-features` to include the native integration tests.
 
 ## Native storage
 
@@ -26,7 +26,13 @@ Leaves own complete values. Each internal node owns one routing separator betwee
 neighboring children, so it has one more child than separator. Separators retain
 the shortest right-row prefix which distinguishes the adjacent rows; fully
 collation-equivalent rows require a full-width separator. An omitted suffix means
-negative infinity only for routing, not for public prefix queries.
+negative infinity only for routing, not for public prefix queries: `[7]` matches
+the prefix of `[7, 42]`, but sorts before it during routing.
+
+Callers supply value comparison; `Collator` supplies key-prefix comparison,
+separator construction, and routing. Collation equality can group distinct
+values, so exact-row matching checks semantic identity separately. `Range` owns
+inclusive/exclusive endpoint comparison.
 
 Schemas validate supplied separator columns through `validate_prefix`; adapters
 own their serialization. The former internal-node structure with one copied
@@ -75,3 +81,7 @@ root-to-leaf path. Lookup is linear in the size of a collation-equivalent group;
 strict validation's exact duplicate checks can require quadratic equality work
 within that group. Replacement combines identity and collision checks when both
 values belong to the same group, and releases read guards before publication.
+
+The executable example shares its schema and file adapters from `examples/support/`.
+Regression tests live in modules under `tests/native/`, compiled as one `native`
+integration target; test-only observations and directory fixtures live in `tests/common/`.

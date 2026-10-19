@@ -27,7 +27,15 @@ pub const KEY_STACK_SIZE: usize = 32;
 /// The type of item in a stream of B+Tree keys
 pub type Key<V> = smallvec::SmallVec<[V; KEY_STACK_SIZE]>;
 
-/// A collator used by a B+Tree
+/// Compares tree keys using a caller-supplied value collator.
+///
+/// Public key comparison compares shared columns: `[7]` matches the prefix of
+/// `[7, 42]`. Private separator routing instead orders `[7]` before `[7, 42]`,
+/// treating an omitted suffix as negative infinity.
+///
+/// B-tree owns separator construction and routing; callers only supply value
+/// comparison. Collation equality does not establish semantic identity: exact
+/// row matching checks value equality separately.
 #[derive(Copy, Clone)]
 pub struct Collator<C> {
     value: C,
@@ -46,9 +54,9 @@ impl<C> Collator<C> {
 }
 
 impl<C: Collate> Collator<C> {
-    // Unlike public prefix matching, routing treats an omitted suffix as
+    // Compare shared columns, then lengths, treating an omitted suffix as
     // negative infinity. Full rows therefore sort after their proper prefixes.
-    fn cmp_fences<L, R>(&self, left: &[L], right: &[R]) -> Ordering
+    fn cmp_routing<L, R>(&self, left: &[L], right: &[R]) -> Ordering
     where
         L: Borrow<C::Value>,
         R: Borrow<C::Value>,
@@ -57,6 +65,9 @@ impl<C: Collate> Collator<C> {
             .then_with(|| left.len().cmp(&right.len()))
     }
 
+    // Keep the right prefix through the first differing column. When all columns
+    // collate equally, retain the full row: truncation would put the separator
+    // before both neighboring rows instead of between them.
     fn separator(&self, left: &[C::Value], right: &[C::Value]) -> Vec<C::Value>
     where
         C::Value: Clone,
@@ -70,6 +81,7 @@ impl<C: Collate> Collator<C> {
         right[..width].to_vec()
     }
 
+    // Compare only shared columns; matching prefixes compare equal.
     fn cmp_slices<L, R>(&self, left: &[L], right: &[R]) -> Ordering
     where
         L: Borrow<C::Value>,
