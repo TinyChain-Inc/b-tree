@@ -37,3 +37,7 @@ uuid = "1.23"
 tbon = { path = "../tbon", version = "0.9", features = ["tokio-io"] }
 rand = "0.10"
 tokio = { version = "1.51", features = ["macros"] }
+
+[[test]]
+name = "native"
+required-features = ["stream"]

@@ -94,7 +94,7 @@ where
                 Node::Index(separators, children) => {
                     validate_children(separators, children)?;
                     let slot = separators.partition_point(|separator| {
-                        self.collator.cmp_fences(separator, key).is_lt()
+                        self.collator.cmp_routing(separator, key).is_lt()
                     });
                     path.push((id, slot));
                     id = children[slot];
@@ -123,7 +123,7 @@ where
             drop(node);
 
             // Do not move an absent key into a subtree beyond its routing
-            // interval. Equal fences remain candidates for semantic identity.
+            // interval. Equal separators remain candidates for semantic identity.
             match self
                 .adjacent_leaf_until(&mut path, true, |separator| {
                     self.collator.cmp_slices(separator, key).is_gt()

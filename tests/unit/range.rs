@@ -34,17 +34,21 @@ fn compact_separators_route_virtual_range_endpoints() {
             (1, 4),
         ),
         (
-            "upper endpoint before first matching fence",
+            "upper endpoint before first matching separator",
             Range::with_bounds(smallvec![2], (Unbounded, Excluded(2))),
             (1, 2),
         ),
         ("between prefixes", Range::from_prefix(smallvec![3]), (4, 5)),
         (
-            "before first fence",
+            "before first separator",
             Range::from_prefix(smallvec![0]),
             (0, 1),
         ),
-        ("after last fence", Range::from_prefix(smallvec![5]), (5, 6)),
+        (
+            "after last separator",
+            Range::from_prefix(smallvec![5]),
+            (5, 6),
+        ),
     ];
 
     for (name, range, expected) in cases {
@@ -59,9 +63,16 @@ fn compact_separators_route_virtual_range_endpoints() {
 #[test]
 fn compact_separator_suffix_is_not_a_prefix_wildcard() {
     let collator = Collator::new(collate::Collator::<i16>::default());
+    assert_eq!(
+        collate::CollateRef::cmp_ref(&collator, &[7][..], &[7, 42][..]),
+        Ordering::Equal
+    );
+    assert_eq!(collator.cmp_routing(&[7], &[7, 42]), Ordering::Less);
+    assert_eq!(collator.cmp_routing(&[7, 42], &[7]), Ordering::Greater);
+
     let range = Range::with_bounds(smallvec![2], (Included(3), Excluded(8)));
     let cases: &[(&str, &[i16], Ordering, Ordering)] = &[
-        ("short fence", &[2], Ordering::Less, Ordering::Less),
+        ("short separator", &[2], Ordering::Less, Ordering::Less),
         ("lower boundary", &[2, 3], Ordering::Equal, Ordering::Less),
         (
             "finite lower suffix",

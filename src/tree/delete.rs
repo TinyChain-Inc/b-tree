@@ -174,7 +174,7 @@ where
                     left_children.len()
                 };
                 if available > self.schema.order().div_ceil(2) {
-                    // Internal redistribution rotates the intervening parent fence.
+                    // Internal redistribution rotates the intervening parent separator.
                     if slot == 0 {
                         let promoted = right.remove(0);
                         left.push(mem::replace(&mut separators[boundary], promoted));

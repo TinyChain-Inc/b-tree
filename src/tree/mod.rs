@@ -315,14 +315,14 @@ where
 
             if keys
                 .windows(2)
-                .any(|pair| self.collator.cmp_fences(&pair[0], &pair[1]).is_gt())
+                .any(|pair| self.collator.cmp_routing(&pair[0], &pair[1]).is_gt())
                 || lower.as_ref().is_some_and(|lower| {
                     keys.first()
-                        .is_some_and(|first| self.collator.cmp_fences(first, lower).is_lt())
+                        .is_some_and(|first| self.collator.cmp_routing(first, lower).is_lt())
                 })
                 || upper.as_ref().is_some_and(|upper| {
                     keys.last()
-                        .is_some_and(|last| self.collator.cmp_fences(last, upper).is_gt())
+                        .is_some_and(|last| self.collator.cmp_routing(last, upper).is_gt())
                 })
             {
                 return Err(invalid("invalid BTree ordering or subtree boundary"));
@@ -335,7 +335,7 @@ where
                         .any(|pair| self.collator.cmp(&pair[0], &pair[1]).is_eq())
                         || upper.as_ref().is_some_and(|upper| {
                             rows.last()
-                                .is_some_and(|row| self.collator.cmp_fences(row, upper).is_eq())
+                                .is_some_and(|row| self.collator.cmp_routing(row, upper).is_eq())
                         });
 
                     if leaf_depth
@@ -395,7 +395,7 @@ where
                                 .is_some_and(|j| self.collator.cmp(row, &rows[j]).is_eq())
                             || upper
                                 .as_ref()
-                                .is_some_and(|upper| self.collator.cmp_fences(row, upper).is_eq());
+                                .is_some_and(|upper| self.collator.cmp_routing(row, upper).is_eq());
 
                         if tied {
                             tree.get(row).await?;
@@ -549,7 +549,7 @@ where
     }
 }
 
-// Internal nodes contain one routing fence between each pair of children.
+// Internal nodes contain one routing separator between each pair of children.
 // In particular, this rejects the former child-minimum representation.
 fn validate_children<V>(separators: &[Vec<V>], children: &[Uuid]) -> io::Result<()> {
     if children.len() < 2 || separators.len() != children.len() - 1 {

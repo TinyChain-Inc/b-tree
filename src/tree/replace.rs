@@ -112,7 +112,7 @@ where
         .map(|next| next.map(|i| self.collator.cmp_slices(&replacement, &rows[i])));
         drop(node);
 
-        // Only a changed leaf extreme can cross a routing fence. At most two
+        // Only a changed leaf extreme can cross a routing separator. At most two
         // ancestor separators need preparation, regardless of tree height.
         let mut boundaries = Vec::with_capacity(2);
         for (forward, local) in [false, true].into_iter().zip(local) {
@@ -157,11 +157,11 @@ where
                 };
 
                 validate_children(separators, children)?;
-                let fence = separators.get(boundary).ok_or_else(|| {
+                let separator = separators.get(boundary).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "missing replacement separator")
                 })?;
-                let previous_order = self.collator.cmp_fences(previous, fence);
-                let neighbor_order = self.collator.cmp_fences(neighbor_row, fence);
+                let previous_order = self.collator.cmp_routing(previous, separator);
+                let neighbor_order = self.collator.cmp_routing(neighbor_row, separator);
 
                 if if forward {
                     previous_order.is_gt() || neighbor_order.is_lt()
@@ -174,7 +174,7 @@ where
                     ));
                 }
 
-                let crosses = self.collator.cmp_fences(&replacement, fence);
+                let crosses = self.collator.cmp_routing(&replacement, separator);
 
                 if if forward {
                     crosses.is_gt()
@@ -186,7 +186,7 @@ where
                     } else {
                         self.collator.separator(neighbor_row, &replacement)
                     };
-                    boundaries.push((level, boundary, fence.clone(), updated));
+                    boundaries.push((level, boundary, separator.clone(), updated));
                 }
 
                 order
@@ -252,7 +252,7 @@ where
         }
 
         // No await or fallible work after the first swap. The directory write
-        // owner excludes readers until all affected routing fences are updated.
+        // owner excludes readers until all affected routing separators are updated.
         for (mut node, changes) in prepared {
             let Node::Index(separators, _) = &mut *node else {
                 unreachable!("validated index ancestor")
