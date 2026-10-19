@@ -46,6 +46,30 @@ impl<C> Collator<C> {
 }
 
 impl<C: Collate> Collator<C> {
+    // Unlike public prefix matching, routing treats an omitted suffix as
+    // negative infinity. Full rows therefore sort after their proper prefixes.
+    fn cmp_fences<L, R>(&self, left: &[L], right: &[R]) -> Ordering
+    where
+        L: Borrow<C::Value>,
+        R: Borrow<C::Value>,
+    {
+        self.cmp_slices(left, right)
+            .then_with(|| left.len().cmp(&right.len()))
+    }
+
+    fn separator(&self, left: &[C::Value], right: &[C::Value]) -> Vec<C::Value>
+    where
+        C::Value: Clone,
+    {
+        let width = left
+            .iter()
+            .zip(right)
+            .position(|(left, right)| !self.value.cmp(left, right).is_eq())
+            .map_or(right.len(), |i| i + 1);
+
+        right[..width].to_vec()
+    }
+
     fn cmp_slices<L, R>(&self, left: &[L], right: &[R]) -> Ordering
     where
         L: Borrow<C::Value>,
@@ -113,7 +137,12 @@ pub trait Schema: Eq + fmt::Debug {
     fn len(&self) -> usize;
 
     /// Get the order of the nodes in a B+Tree with this [`Schema`].
+    /// Must be at least three so splitting preserves two children per index.
     fn order(&self) -> usize;
+
+    /// Validate a nonempty routing prefix, including every supplied column type.
+    /// A prefix must contain no more than [`Schema::len`] columns.
+    fn validate_prefix(&self, prefix: &[Self::Value]) -> Result<(), Self::Error>;
 
     /// Return a validated version of the given `key`, or a validation error.
     fn validate_key(&self, key: Vec<Self::Value>) -> Result<Vec<Self::Value>, Self::Error>;

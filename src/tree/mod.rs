@@ -107,6 +107,7 @@ where
 
     /// Create a new [`BTreeLock`], awaiting admission of its root in `dir`.
     pub async fn create(schema: S, collator: C, dir: DirLock<FE>) -> Result<Self, io::Error> {
+        validate_order(schema.order())?;
         let mut nodes = dir.try_write_owned()?;
 
         if nodes.is_empty() {
@@ -127,6 +128,7 @@ where
 
     /// Load a [`BTreeLock`] with the given `schema` and `collator` from `dir`.
     pub fn load(schema: S, collator: C, dir: DirLock<FE>) -> Result<Self, io::Error> {
+        validate_order(schema.order())?;
         {
             let nodes = dir.try_read()?;
             if !nodes.contains(&ROOT) {
@@ -258,73 +260,148 @@ where
                 return Err(invalid("invalid BTree node entry"));
             }
         }
+
         let mut seen = HashSet::new();
-        let mut pending = vec![(ROOT, None, None, 0)];
+        let mut pending = vec![(ROOT, None::<Vec<S::Value>>, None::<Vec<S::Value>>, 0)];
         let mut leaf_depth = None;
+        let mut has_ties = false;
+
         while let Some((id, lower, upper, depth)) = pending.pop() {
             if !seen.insert(id) {
                 return Err(invalid("repeated BTree node"));
             }
+
             let node = tree
                 .dir
                 .as_dir()
                 .read_file::<_, Node<S::Value>>(&id)
                 .await?;
+
+            // Collators only receive columns accepted by the owning schema.
             let keys = match &*node {
-                Node::Leaf(keys) | Node::Index(keys, _) => keys,
+                Node::Leaf(rows) => {
+                    let order = self.schema.order();
+                    let valid_count = if id == ROOT {
+                        rows.len() <= order
+                    } else {
+                        rows.len() >= order / 2 && rows.len() < order
+                    };
+
+                    if !valid_count
+                        || rows.iter().any(|row| {
+                            row.len() != self.schema.len()
+                                || self.schema.validate_key(row.clone()).is_err()
+                        })
+                    {
+                        return Err(invalid("invalid BTree leaf"));
+                    }
+
+                    rows
+                }
+                Node::Index(separators, children) => {
+                    validate_children(separators, children)?;
+                    if children.len() > self.schema.order()
+                        || (id != ROOT && children.len() < self.schema.order().div_ceil(2))
+                        || separators
+                            .iter()
+                            .any(|prefix| self.schema.validate_prefix(prefix).is_err())
+                    {
+                        return Err(invalid("invalid BTree separators"));
+                    }
+
+                    separators
+                }
             };
-            if keys.len() > self.schema.order()
-                || keys.iter().any(|key| key.len() != self.schema.len())
-                || keys
-                    .iter()
-                    .any(|key| self.schema.validate_key(key.clone()).is_err())
-                || keys
-                    .windows(2)
-                    .any(|pair| self.collator.cmp(&pair[0], &pair[1]).is_gt())
-                || lower
-                    .as_ref()
-                    .is_some_and(|lower| keys.first().is_none_or(|first| first != lower))
+
+            if keys
+                .windows(2)
+                .any(|pair| self.collator.cmp_fences(&pair[0], &pair[1]).is_gt())
+                || lower.as_ref().is_some_and(|lower| {
+                    keys.first()
+                        .is_some_and(|first| self.collator.cmp_fences(first, lower).is_lt())
+                })
                 || upper.as_ref().is_some_and(|upper| {
                     keys.last()
-                        .is_some_and(|last| self.collator.cmp(last, upper).is_gt())
+                        .is_some_and(|last| self.collator.cmp_fences(last, upper).is_gt())
                 })
             {
-                return Err(invalid("invalid BTree bounds"));
+                return Err(invalid("invalid BTree ordering or subtree boundary"));
             }
-            if let Node::Leaf(rows) = &*node {
-                for (i, row) in rows.iter().enumerate() {
-                    // Only collation ties need an identity scan; bounds are copies,
-                    // not additional values. Scan without collecting the group.
-                    let tied = rows
-                        .get(i + 1)
-                        .is_some_and(|next| self.collator.cmp(row, next).is_eq())
-                        || i.checked_sub(1)
-                            .is_some_and(|j| self.collator.cmp(row, &rows[j]).is_eq())
-                        || upper
-                            .as_ref()
-                            .is_some_and(|upper| self.collator.cmp(row, upper).is_eq());
-                    if tied {
-                        tree.get(row).await?;
+
+            match &*node {
+                Node::Leaf(rows) => {
+                    has_ties |= rows
+                        .windows(2)
+                        .any(|pair| self.collator.cmp(&pair[0], &pair[1]).is_eq())
+                        || upper.as_ref().is_some_and(|upper| {
+                            rows.last()
+                                .is_some_and(|row| self.collator.cmp_fences(row, upper).is_eq())
+                        });
+
+                    if leaf_depth
+                        .replace(depth)
+                        .is_some_and(|prior| prior != depth)
+                    {
+                        return Err(invalid("unbalanced BTree"));
+                    }
+                }
+                Node::Index(separators, children) => {
+                    for (i, child) in children.iter().enumerate() {
+                        pending.push((
+                            *child,
+                            i.checked_sub(1)
+                                .map(|j| separators[j].clone())
+                                .or_else(|| lower.clone()),
+                            separators.get(i).cloned().or_else(|| upper.clone()),
+                            depth + 1,
+                        ));
                     }
                 }
             }
-            if let Node::Index(bounds, children) = &*node {
-                if bounds.is_empty() || bounds.len() != children.len() {
-                    return Err(invalid("invalid BTree children"));
+        }
+
+        // Validate every structural path before identity lookup follows any of
+        // them. Otherwise a tied leaf could start a lookup through a corrupt
+        // sibling cycle before the structural traversal reaches that sibling.
+        if !has_ties {
+            return Ok(());
+        }
+
+        let mut pending = vec![(ROOT, None::<Vec<S::Value>>)];
+
+        while let Some((id, upper)) = pending.pop() {
+            let node = tree
+                .dir
+                .as_dir()
+                .read_file::<_, Node<S::Value>>(&id)
+                .await?;
+
+            match &*node {
+                Node::Index(separators, children) => {
+                    for (i, child) in children.iter().enumerate() {
+                        pending
+                            .push((*child, separators.get(i).cloned().or_else(|| upper.clone())));
+                    }
                 }
-                for (i, child) in children.iter().enumerate() {
-                    pending.push((
-                        *child,
-                        Some(bounds[i].clone()),
-                        bounds.get(i + 1).cloned().or_else(|| upper.clone()),
-                        depth + 1,
-                    ));
+                Node::Leaf(rows) => {
+                    for (i, row) in rows.iter().enumerate() {
+                        // Exact identity remains independent of collation. Checking
+                        // each tied row is quadratic in a large equivalent group,
+                        // without collecting that group or counting routing copies.
+                        let tied = rows
+                            .get(i + 1)
+                            .is_some_and(|next| self.collator.cmp(row, next).is_eq())
+                            || i.checked_sub(1)
+                                .is_some_and(|j| self.collator.cmp(row, &rows[j]).is_eq())
+                            || upper
+                                .as_ref()
+                                .is_some_and(|upper| self.collator.cmp_fences(row, upper).is_eq());
+
+                        if tied {
+                            tree.get(row).await?;
+                        }
+                    }
                 }
-            } else if leaf_depth
-                .replace(depth)
-                .is_some_and(|prior| prior != depth)
-            {
-                return Err(invalid("unbalanced BTree"));
             }
         }
 
@@ -469,5 +546,29 @@ where
                 that, this
             ),
         ))
+    }
+}
+
+// Internal nodes contain one routing fence between each pair of children.
+// In particular, this rejects the former child-minimum representation.
+fn validate_children<V>(separators: &[Vec<V>], children: &[Uuid]) -> io::Result<()> {
+    if children.len() < 2 || separators.len() != children.len() - 1 {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid BTree children",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_order(order: usize) -> io::Result<()> {
+    if order < 3 {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BTree order must be at least three",
+        ))
+    } else {
+        Ok(())
     }
 }

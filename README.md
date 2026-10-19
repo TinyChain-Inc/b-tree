@@ -18,9 +18,21 @@ history and interrupted-materialization recovery belong to the caller.
 `truncate()` removes old nodes before admitting the replacement root; failure or
 cancellation may therefore leave incomplete storage which loading rejects.
 
-`validate()` checks reachable structure, ordering and node identities. `copy_into()`
+`validate()` owns whole-tree structural, ordering, and identity checks. `copy_into()`
 copies reachable nodes into empty delegated storage; callers coordinate source
 access. Neither introduces immutable root generations or version reclamation.
+
+Leaves own complete values. Each internal node owns one routing separator between
+neighboring children, so it has one more child than separator. Separators retain
+the shortest right-row prefix which distinguishes the adjacent rows; fully
+collation-equivalent rows require a full-width separator. An omitted suffix means
+negative infinity only for routing, not for public prefix queries.
+
+Schemas validate supplied separator columns through `validate_prefix`; adapters
+own their serialization. The former internal-node structure with one copied
+minimum per child is incompatible and is rejected by structural validation.
+Recreate storage containing those internal nodes; loading never migrates it.
+Leaf encoding, logical row streams, and payload tags are unchanged.
 
 ## Filesystem codecs
 
@@ -43,17 +55,10 @@ its payload guard. This conversion is synchronous; node traversal owns read
 concurrency. Ordered insertion checks duplicates across the equivalent group
 when the next input ties the previous collation.
 
-`BTreeWriteGuard::replace` changes one exact row in place, including affected
-first-row copies in index nodes. It distinguishes semantic equality from collation ties and rejects
-changes that would cross a neighbor or duplicate another value; it never deletes/reinserts.
-A replacement may compare differently from its previous value, provided it remains
-between its actual predecessor and successor, allowing unequal values with equal
-collation. Replacement always publishes the supplied row, even when it is
-semantically equal to the old row. This public operation is
-safe to call directly; callers need no additional ordering guard.
-Input checks and affected-node validation complete before synchronous publication,
-so rejection or cancellation before publication leaves row contents unchanged.
-This is not a durability or cross-index atomicity guarantee.
+[`BTreeWriteGuard::replace`](https://docs.rs/b-tree/latest/b_tree/struct.BTree.html#method.replace)
+changes one row in place while preserving its position and the tree topology.
+Its API documentation defines collision checks and the publication boundary;
+callers remain responsible for durability and cross-index recovery.
 
 The private `tree` modules separate reads/traversal, insertion, deletion,
 replacement, and stream decoding. The module root owns public handles and shared

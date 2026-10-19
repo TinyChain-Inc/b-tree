@@ -99,6 +99,78 @@ impl<V> Range<V> {
     }
 }
 
+impl<V> Range<V> {
+    // Routing treats a separator's omitted suffix as negative infinity. Query
+    // endpoints use a virtual suffix as well, without allocating sentinel values.
+    pub(crate) fn cmp_endpoint<C>(
+        &self,
+        separator: &[C::Value],
+        lower: bool,
+        collator: &Collator<C>,
+    ) -> Ordering
+    where
+        V: Borrow<C::Value>,
+        C: Collate,
+    {
+        let bound = if lower { &self.start } else { &self.end };
+        let maximum = matches!(
+            (lower, bound),
+            (true, Bound::Excluded(_)) | (false, Bound::Included(_) | Bound::Unbounded)
+        );
+        let endpoint_len = self.prefix.len() + usize::from(!matches!(bound, Bound::Unbounded));
+
+        for (i, value) in separator.iter().enumerate() {
+            let endpoint = if let Some(prefix) = self.prefix.get(i) {
+                prefix.borrow()
+            } else if i == self.prefix.len() {
+                match bound {
+                    Bound::Included(value) | Bound::Excluded(value) => value.borrow(),
+                    Bound::Unbounded => {
+                        return if maximum {
+                            Ordering::Less
+                        } else {
+                            Ordering::Greater
+                        };
+                    }
+                }
+            } else {
+                return if maximum {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                };
+            };
+
+            let order = collator.value.cmp(value, endpoint);
+            if !order.is_eq() {
+                return order;
+            }
+        }
+
+        if separator.len() < endpoint_len || maximum {
+            Ordering::Less
+        } else {
+            Ordering::Equal
+        }
+    }
+
+    pub(crate) fn child_slots<C>(
+        &self,
+        separators: &[Vec<C::Value>],
+        collator: &Collator<C>,
+    ) -> (usize, usize)
+    where
+        V: Borrow<C::Value>,
+        C: Collate,
+    {
+        let start =
+            separators.partition_point(|row| self.cmp_endpoint(row, true, collator).is_lt());
+        let end =
+            separators.partition_point(|row| !self.cmp_endpoint(row, false, collator).is_gt()) + 1;
+        (start, end)
+    }
+}
+
 impl<BV, C> OverlapsValue<Vec<C::Value>, Collator<C>> for Range<BV>
 where
     BV: Borrow<C::Value>,
@@ -267,3 +339,7 @@ impl<K: fmt::Debug> fmt::Debug for Range<K> {
         write!(f, " with prefix {:?}", self.prefix)
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/range.rs"]
+mod tests;

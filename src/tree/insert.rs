@@ -1,5 +1,6 @@
 //! Ordinary and ordered insertion share splitting and ancestor propagation.
 
+use std::cmp::Ordering;
 use std::{io, mem, pin::Pin};
 
 use collate::Collate;
@@ -15,10 +16,8 @@ use crate::range::Range;
 type ResultInsert<V> = Result<Insert<V>, io::Error>;
 
 enum Insert<V> {
-    Left(Vec<V>),
-    Right,
-    OverflowLeft(Vec<V>, Vec<V>, Uuid),
-    Overflow(Vec<V>, Uuid),
+    Complete,
+    Split(Vec<V>, Uuid),
 }
 
 impl<S, C, FE> BTree<S, C, DirWriteGuardOwned<FE>>
@@ -27,7 +26,7 @@ where
     C: Collate<Value = S::Value> + Send + Sync,
     FE: AsType<Node<S::Value>> + Send + Sync + FileLoad,
 {
-    /// Return `false` if te given `key` is already present.
+    /// Return `false` if the given `key` is already present.
     pub async fn insert(&mut self, key: Vec<S::Value>) -> Result<bool, io::Error> {
         let key = validate_key(&*self.schema, key)?;
         self.insert_root(key).await
@@ -65,17 +64,15 @@ where
                 let key = validate_key(&*self.schema, key)?;
 
                 if let Some(previous) = &previous {
-                    if self.collator.cmp_slices(&key, previous).is_lt() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "ordered insertion precedes the current maximum",
-                        ));
-                    }
-
-                    if self.collator.cmp_slices(&key, previous).is_eq()
-                        && self.contains(&key).await?
-                    {
-                        continue;
+                    match self.collator.cmp_slices(&key, previous) {
+                        Ordering::Less => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "ordered insertion precedes the current maximum",
+                            ));
+                        }
+                        Ordering::Equal if self.contains(&key).await? => continue,
+                        _ => {}
                     }
                 }
 
@@ -88,7 +85,7 @@ where
                     };
 
                     // Leave splitting and empty-root initialization to insert_root.
-                    // Appending to a nonempty leaf never changes an ancestor bound.
+                    // Appending to a nonempty leaf never changes a routing separator.
                     let limit = if leaf_id == ROOT {
                         self.schema.order()
                     } else {
@@ -118,9 +115,11 @@ where
 
         loop {
             let node = self.dir.read_file::<_, Node<S::Value>>(&id).await?;
+
             match &*node {
                 Node::Leaf(_) => return Ok((id, node)),
-                Node::Index(_, children) => {
+                Node::Index(separators, children) => {
+                    super::validate_children(separators, children)?;
                     id = *children.last().ok_or_else(|| {
                         io::Error::new(io::ErrorKind::InvalidData, "empty BTree index")
                     })?;
@@ -129,107 +128,17 @@ where
         }
     }
 
-    async fn create_node(
-        &mut self,
-        node: Node<S::Value>,
-    ) -> Result<(Uuid, freqfs::FileLock<FE>), io::Error> {
-        self.dir.create_file_unique(node).await
-    }
-
     async fn insert_root(&mut self, key: Vec<S::Value>) -> Result<bool, io::Error> {
         let (path, present) = self.locate(&key).await?;
         if present {
             return Ok(false);
         }
-        let order = self.schema.order();
 
         let mut root = self.write_node(&ROOT).await?;
-        let new_root = match &*root {
-            Node::Leaf(_) => {
-                let i = path[0].1;
-
-                let Node::Leaf(keys) = &mut *root else {
-                    unreachable!("leaf")
-                };
-                keys.insert(i, key);
-
-                if keys.len() > order {
-                    let mid = order.div_ceil(2);
-
-                    let right: Vec<_> = keys.drain(mid..).collect();
-                    debug_assert!(right.len() >= mid);
-
-                    let right_key = right[0].clone();
-                    let (right, _) = self.create_node(Node::Leaf(right)).await?;
-
-                    let left: Vec<_> = mem::take(keys);
-                    debug_assert!(left.len() >= mid);
-
-                    let left_key = left[0].clone();
-                    let (left, _) = self.create_node(Node::Leaf(left)).await?;
-
-                    Some(Node::Index(vec![left_key, right_key], vec![left, right]))
-                } else {
-                    None
-                }
-            }
-            Node::Index(bounds, children) => {
-                debug_assert_eq!(bounds.len(), children.len());
-
-                let i = path[0].1;
-
-                let mut child = self.write_node(&children[i]).await?;
-                let result = self.insert_inner(&mut child, key, &path[1..]).await?;
-                let Node::Index(bounds, children) = &mut *root else {
-                    unreachable!("index")
-                };
-
-                match result {
-                    Insert::Right => {}
-                    Insert::Left(key) => {
-                        bounds[i] = key;
-                    }
-                    Insert::OverflowLeft(left, middle, child_id) => {
-                        bounds[i] = left;
-                        bounds.insert(i + 1, middle);
-                        children.insert(i + 1, child_id);
-                    }
-                    Insert::Overflow(bound, child_id) => {
-                        bounds.insert(i + 1, bound);
-                        children.insert(i + 1, child_id);
-                    }
-                }
-
-                // debug_assert!(self.collator.is_sorted(&bounds));
-                debug_assert_eq!(bounds.len(), children.len());
-
-                if children.len() > order {
-                    let right_bounds: Vec<_> = bounds.drain(order.div_ceil(2)..).collect();
-                    let right_children: Vec<_> = children.drain(order.div_ceil(2)..).collect();
-                    let right_bound = right_bounds[0].clone();
-                    let (right_node_id, _) = self
-                        .create_node(Node::Index(right_bounds, right_children))
-                        .await?;
-
-                    let left_bounds: Vec<_> = mem::take(bounds);
-                    let left_children: Vec<_> = mem::take(children);
-                    let left_bound = left_bounds[0].clone();
-                    let (left_node_id, _) = self
-                        .create_node(Node::Index(left_bounds, left_children))
-                        .await?;
-
-                    Some(Node::Index(
-                        vec![left_bound, right_bound],
-                        vec![left_node_id, right_node_id],
-                    ))
-                } else {
-                    None
-                }
-            }
-        };
-
-        if let Some(new_root) = new_root {
-            *root = new_root;
+        if let Insert::Split(separator, right) = self.insert_inner(&mut root, key, &path).await? {
+            let left = mem::replace(&mut *root, Node::Leaf(Vec::new()));
+            let (left, _) = self.dir.create_file_unique(left).await?;
+            *root = Node::Index(vec![separator], vec![left, right]);
         }
 
         Ok(true)
@@ -243,108 +152,52 @@ where
     ) -> Pin<Box<dyn Future<Output = ResultInsert<S::Value>> + Send + 'a>> {
         Box::pin(async move {
             let order = self.schema.order();
-            match &**node {
-                Node::Leaf(_) => {
-                    let i = path[0].1;
-
-                    let Node::Leaf(keys) = &mut **node else {
-                        unreachable!("leaf")
-                    };
-                    keys.insert(i, key);
-
-                    let mid = order / 2;
-
-                    if keys.len() >= order {
-                        let new_leaf: Vec<_> = keys.drain(mid..).collect();
-
-                        debug_assert!(new_leaf.len() >= mid);
-                        debug_assert!(keys.len() >= mid);
-
-                        let middle_key = new_leaf[0].to_vec();
-                        let node = Node::Leaf(new_leaf);
-                        let (new_node_id, _) = self.create_node(node).await?;
-
-                        if i == 0 {
-                            Ok(Insert::OverflowLeft(
-                                keys[0].to_vec(),
-                                middle_key,
-                                new_node_id,
-                            ))
-                        } else {
-                            Ok(Insert::Overflow(middle_key, new_node_id))
-                        }
-                    } else {
-                        debug_assert!(keys.len() > mid);
-
-                        if i == 0 {
-                            Ok(Insert::Left(keys[0].to_vec()))
-                        } else {
-                            Ok(Insert::Right)
-                        }
+            let slot = path[0].1;
+            let (separator, right) = match &mut **node {
+                Node::Leaf(rows) => {
+                    rows.insert(slot, key);
+                    let root = path[0].0 == ROOT;
+                    if rows.len() < order || (root && rows.len() == order) {
+                        return Ok(Insert::Complete);
                     }
+
+                    let mid = if root { order.div_ceil(2) } else { order / 2 };
+                    let right = rows.split_off(mid);
+                    let separator = self
+                        .collator
+                        .separator(rows.last().expect("split left"), &right[0]);
+
+                    (separator, Node::Leaf(right))
                 }
-                Node::Index(bounds, children) => {
-                    debug_assert_eq!(bounds.len(), children.len());
-
-                    let i = path[0].1;
-
-                    let mut child = self.write_node(&children[i]).await?;
-
+                Node::Index(separators, children) => {
+                    super::validate_children(separators, children)?;
+                    let mut child = self.write_node(&children[slot]).await?;
                     let result = self.insert_inner(&mut child, key, &path[1..]).await?;
-                    let Node::Index(bounds, children) = &mut **node else {
-                        unreachable!("index")
-                    };
-                    let overflow_left = match result {
-                        Insert::Right => return Ok(Insert::Right),
-                        Insert::Left(key) => {
-                            bounds[i] = key;
+                    drop(child);
 
-                            return if i == 0 {
-                                Ok(Insert::Left(bounds[i].to_vec()))
-                            } else {
-                                Ok(Insert::Right)
-                            };
-                        }
-                        Insert::OverflowLeft(left, middle, child_id) => {
-                            bounds[i] = left;
-                            bounds.insert(i + 1, middle);
-                            children.insert(i + 1, child_id);
-                            i == 0
-                        }
-                        Insert::Overflow(bound, child_id) => {
-                            bounds.insert(i + 1, bound);
-                            children.insert(i + 1, child_id);
-                            false
-                        }
+                    let Insert::Split(separator, right) = result else {
+                        return Ok(Insert::Complete);
                     };
 
-                    // debug_assert!(self.collator.is_sorted(bounds));
-
-                    if children.len() > order {
-                        let mid = self.schema.order().div_ceil(2);
-                        let new_bounds: Vec<_> = bounds.drain(mid..).collect();
-                        let new_children: Vec<_> = children.drain(mid..).collect();
-
-                        let left_bound = new_bounds[0].to_vec();
-                        let node = Node::Index(new_bounds, new_children);
-                        let (node_id, _) = self.create_node(node).await?;
-
-                        if overflow_left {
-                            Ok(Insert::OverflowLeft(
-                                bounds[0].to_vec(),
-                                left_bound,
-                                node_id,
-                            ))
-                        } else {
-                            Ok(Insert::Overflow(left_bound, node_id))
-                        }
-                    } else if i == 0 {
-                        Ok(Insert::Left(bounds[0].to_vec()))
-                    } else {
-                        Ok(Insert::Right)
+                    separators.insert(slot, separator);
+                    children.insert(slot + 1, right);
+                    if children.len() <= order {
+                        return Ok(Insert::Complete);
                     }
+
+                    // The boundary between the resulting child groups belongs
+                    // only to their parent, not to either split index.
+                    let mid = order.div_ceil(2);
+                    let right_children = children.split_off(mid);
+                    let right_separators = separators.split_off(mid);
+                    let separator = separators.pop().expect("split boundary");
+
+                    (separator, Node::Index(right_separators, right_children))
                 }
-            }
+            };
+
+            let (right, _) = self.dir.create_file_unique(right).await?;
+            Ok(Insert::Split(separator, right))
         })
     }
 }

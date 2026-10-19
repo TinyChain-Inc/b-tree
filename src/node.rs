@@ -133,6 +133,8 @@ impl<V: fmt::Debug> Block<V> for Vec<Vec<V>> {
 /// A node in a B+Tree
 #[derive(Clone)]
 pub enum Node<N> {
+    /// Routing separators followed by children; there is one more child than
+    /// separator. Leaf values remain complete rows.
     Index(N, Vec<Uuid>),
     Leaf(N),
 }
@@ -191,9 +193,9 @@ where
                 Err(cause) => Err(cause),
             }
         } else {
-            let bounds = seq.expect_next(self.context).await?;
+            let separators = seq.expect_next(self.context).await?;
             let children = seq.expect_next(()).await?;
-            Ok(Node::Index(bounds, children))
+            Ok(Node::Index(separators, children))
         }
     }
 }
@@ -221,7 +223,7 @@ where
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
         match self {
             Node::Leaf(keys) => (true, keys).into_stream(encoder),
-            Node::Index(bounds, children) => (false, bounds, children).into_stream(encoder),
+            Node::Index(separators, children) => (false, separators, children).into_stream(encoder),
         }
     }
 }
@@ -236,7 +238,7 @@ where
 
         match self {
             Node::Leaf(keys) => (true, keys).into_stream(encoder),
-            Node::Index(bounds, children) => (false, bounds, children).into_stream(encoder),
+            Node::Index(separators, children) => (false, separators, children).into_stream(encoder),
         }
     }
 }
@@ -246,10 +248,10 @@ impl<N: fmt::Debug> fmt::Debug for Node<N> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Leaf(keys) => write!(f, "leaf node with keys {:?}", keys),
-            Self::Index(bounds, children) => write!(
+            Self::Index(separators, children) => write!(
                 f,
-                "index node with bounds {:?} and children {:?}",
-                bounds, children
+                "index node with separators {:?} and children {:?}",
+                separators, children
             ),
         }
     }
@@ -260,7 +262,7 @@ impl<V: fmt::Debug> fmt::Debug for Node<V> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Leaf(_keys) => write!(f, "a leaf node"),
-            Self::Index(_bounds, children) => {
+            Self::Index(_separators, children) => {
                 write!(f, "an index node with {} children", children.len())
             }
         }
