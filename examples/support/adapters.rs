@@ -139,22 +139,6 @@ impl get_size::GetSize for File {
 }
 
 impl freqfs::FileLoad for File {
-    async fn load_size(
-        _: &std::path::Path,
-        _: &mut tokio::fs::File,
-        metadata: &std::fs::Metadata,
-    ) -> io::Result<usize> {
-        // TBON sequences have no allocation-sized length header. Every retained
-        // row/cell needs encoded input; cover geometric Vec growth and scalar
-        // payload bytes before decoding without retaining any parsed payload.
-        let encoded = usize::try_from(metadata.len()).map_err(io::Error::other)?;
-        let per_byte = 2 * std::mem::size_of::<Vec<i16>>() + 8 * std::mem::size_of::<i16>() + 32;
-        encoded
-            .checked_mul(per_byte)
-            .and_then(|size| size.checked_add(std::mem::size_of::<Self>()))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "node too large"))
-    }
-
     async fn load(
         _: &std::path::Path,
         file: tokio::fs::File,
