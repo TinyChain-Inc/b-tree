@@ -3,8 +3,6 @@ use std::io;
 use collate::Collator;
 use freqfs::Cache;
 use futures::TryStreamExt;
-#[cfg(test)]
-use get_size::GetSize;
 use rand::RngExt;
 use smallvec::smallvec;
 
