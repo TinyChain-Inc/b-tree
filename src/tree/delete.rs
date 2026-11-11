@@ -1,8 +1,6 @@
 //! Deletion owns borrowing, merging, and root collapse.
 
-use std::borrow::Borrow;
-use std::pin::Pin;
-use std::{io, mem};
+use std::{borrow::Borrow, io, mem, pin::Pin};
 
 use collate::Collate;
 use freqfs::{DirWriteGuardOwned, FileLoad, FileWriteGuardOwned};
@@ -18,11 +16,18 @@ where
     C: Collate<Value = S::Value> + Send + Sync,
     FE: AsType<Node<S::Value>> + Send + Sync + FileLoad,
 {
-    /// Delete the given `key` from this B+Tree.
+    /// Delete the complete `key` from this B+Tree. Invalid widths reject before lookup.
     pub async fn delete<V>(&mut self, key: &[V]) -> Result<bool, io::Error>
     where
         V: Borrow<S::Value> + Send + Sync,
     {
+        if key.len() != self.schema.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid deletion key width",
+            ));
+        }
+
         let (path, present) = self.locate(key).await?;
         if !present {
             return Ok(false);
