@@ -1,6 +1,123 @@
 use super::*;
 
 #[tokio::test]
+async fn deletion_requires_complete_keys_before_mutation() -> io::Result<()> {
+    use futures::FutureExt;
+
+    for count in [1_i16, 80] {
+        let fixture = TestDir::new("complete_deletion_keys")?;
+        {
+            let cache =
+                Cache::<File>::new(1024 * 1024, Some(1), 0, std::time::Duration::from_secs(3));
+            let dir = cache.load(fixture.path().to_owned())?;
+
+            let tree = BTreeLock::create(
+                ExampleSchema::<i16>::new(2),
+                Collator::default(),
+                dir.clone(),
+            )
+            .await?;
+            for key in 0..count {
+                tree.write().await.insert(vec![key, key + 100]).await?;
+            }
+
+            let root = dir
+                .read()
+                .await
+                .get_file(
+                    uuid::Uuid::nil()
+                        .hyphenated()
+                        .encode_lower(&mut uuid::Uuid::encode_buffer()),
+                )
+                .unwrap()
+                .clone();
+            {
+                let mut writer = tree.write().await;
+                let held = root.write::<Node<Vec<Vec<i16>>>>().await?;
+                let before = held.clone();
+                for key in [vec![], vec![0], vec![0, 100, 200]] {
+                    let error = writer
+                        .delete(&key)
+                        .now_or_never()
+                        .expect("invalid key waited for storage")
+                        .unwrap_err();
+                    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                    let borrowed: Vec<_> = key.iter().collect();
+                    let error = writer
+                        .delete(&borrowed)
+                        .now_or_never()
+                        .expect("invalid borrowed key waited for storage")
+                        .unwrap_err();
+                    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                }
+                match (&*held, &before) {
+                    (Node::Leaf(actual), Node::Leaf(expected)) => assert_eq!(actual, expected),
+                    (Node::Index(actual, children), Node::Index(expected, expected_children)) => {
+                        assert_eq!(actual, expected);
+                        assert_eq!(children, expected_children);
+                    }
+                    _ => panic!("invalid deletion changed the root type"),
+                }
+            }
+
+            let rows: Vec<_> = tree
+                .read()
+                .await
+                .keys(Range::<i16>::default())
+                .await?
+                .map_ok(|row| row.into_vec())
+                .try_collect()
+                .await?;
+            assert_eq!(
+                rows,
+                (0..count)
+                    .map(|key| vec![key, key + 100])
+                    .collect::<Vec<_>>()
+            );
+            {
+                let mut writer = tree.write().await;
+                assert!(!writer.delete(&[999, 999]).await?);
+                let key = [0, 100];
+                assert!(writer.delete(&[&key[0], &key[1]]).await?);
+                assert!(!writer.delete(&key).await?);
+                if count > 1 {
+                    assert!(writer.delete(&[1, 101]).await?);
+                }
+            }
+            tree.validate().await?;
+            tree.sync_all().await?;
+        }
+        {
+            let cache =
+                Cache::<File>::new(1024 * 1024, Some(1), 0, std::time::Duration::from_secs(3));
+            let tree = BTreeLock::load(
+                ExampleSchema::<i16>::new(2),
+                Collator::default(),
+                cache.load(fixture.path().to_owned())?,
+            )?;
+            tree.validate().await?;
+            let rows: Vec<_> = tree
+                .read()
+                .await
+                .keys(Range::<i16>::default())
+                .await?
+                .map_ok(|row| row.into_vec())
+                .try_collect()
+                .await?;
+            let start = if count == 1 { 1 } else { 2 };
+            assert_eq!(
+                rows,
+                (start..count)
+                    .map(|key| vec![key, key + 100])
+                    .collect::<Vec<_>>()
+            );
+        }
+        fixture.close()?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn replacement_preserves_slots_separators_and_topology() -> io::Result<()> {
     #[derive(Clone, Eq, PartialEq)]
     struct Tens;

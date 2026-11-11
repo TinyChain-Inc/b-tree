@@ -1,5 +1,6 @@
 use std::io;
 
+use b_tree::{BTreeLock, Node, Range, Schema};
 use collate::Collator;
 use freqfs::Cache;
 use futures::TryStreamExt;
@@ -10,7 +11,6 @@ use smallvec::smallvec;
 use self::adapters::{BLOCK_SIZE, ExampleSchema, File};
 use self::directory::TestDir;
 use self::observations::{COLLATIONS, INDEX_WRITES, LEAF_READS};
-use b_tree::{BTreeLock, Node, Range, Schema};
 
 #[path = "../examples/support/adapters.rs"]
 mod adapters;

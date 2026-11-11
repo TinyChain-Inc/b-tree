@@ -1,9 +1,11 @@
 //! Bounded native reads and ordered node traversal.
 
-use std::borrow::Borrow;
-use std::ops::{ControlFlow, Deref};
-use std::pin::Pin;
-use std::{fmt, io};
+use std::{
+    borrow::Borrow,
+    fmt, io,
+    ops::{ControlFlow, Deref},
+    pin::Pin,
+};
 
 use collate::{Collate, OverlapsValue};
 use freqfs::{DirDeref, FileLoad, FileReadGuard};
@@ -526,7 +528,7 @@ where
     {
         range.validate(self.schema.len(), &self.collator)?;
         let mut nodes = nodes(
-            self.dir.clone(),
+            &self.dir,
             self.collator.clone(),
             range,
             ROOT,

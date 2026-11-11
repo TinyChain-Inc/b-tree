@@ -113,9 +113,11 @@ integration target; test-only observations and directory fixtures live in `tests
 
 Native range streams can borrow storage within a scope; the owned `Keys` alias
 continues to retain static ownership. `BTree::as_ref` borrows the storage owner
-instead of cloning its lock. Ordinary traversal detects ancestor cycles before
-descending. Count retains bounded child IDs and releases parent access before
-reading children, including with one available I/O slot.
+instead of cloning its lock. Scoped `visit` traversal also borrows that owner,
+including across buffered branches; retained key streams keep their own handles.
+Ordinary traversal detects ancestor cycles before descending. Count retains bounded
+child IDs and releases parent access before reading children, including with one
+available I/O slot.
 
 Visited index nodes validate separator/child cardinality, schema-valid prefixes,
 and nondecreasing separator order before routing or mutation. These local checks
@@ -129,6 +131,9 @@ the existing schema owner, while scoped visits borrow it. Scoped streams require
 only that their schema outlive the result; they do not impose `'static` on all
 schemas. Point reads retain their existing schema bounds. This is a public Rust
 bound change, without a storage-format change or alternate traversal path.
+
+Deletion requires a complete schema-width key; other widths return `InvalidInput`
+before lookup or mutation.
 
 Native mutations use insertion, replacement, deletion, and truncation. Cross-tree
 `merge` and `delete_all`, and unique-prefix `groups` streams, are no longer public
