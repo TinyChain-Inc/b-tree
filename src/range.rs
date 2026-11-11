@@ -1,7 +1,7 @@
 use std::borrow::Borrow;
 use std::cmp::Ordering;
-use std::fmt;
 use std::ops::{Bound, Range as Bounds};
+use std::{fmt, io};
 
 use collate::{Collate, Overlap, OverlapsRange, OverlapsValue};
 use smallvec::smallvec;
@@ -100,6 +100,34 @@ impl<V> Range<V> {
 }
 
 impl<V> Range<V> {
+    pub(super) fn validate<C>(&self, columns: usize, collator: &Collator<C>) -> io::Result<()>
+    where
+        V: Borrow<C::Value>,
+        C: Collate,
+    {
+        if self.len() > columns {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BTree range references a column outside its schema",
+            ));
+        }
+
+        match (&self.start, &self.end) {
+            (
+                Bound::Included(start) | Bound::Excluded(start),
+                Bound::Included(end) | Bound::Excluded(end),
+            ) if collator.value.cmp(start.borrow(), end.borrow()).is_gt() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "BTree range starts after its end",
+                ));
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
     // Routing treats a separator's omitted suffix as negative infinity. Query
     // endpoints use a virtual suffix as well, without allocating sentinel values.
     pub(crate) fn cmp_endpoint<C>(
@@ -171,13 +199,12 @@ impl<V> Range<V> {
     }
 }
 
-impl<BV, C> OverlapsValue<Vec<C::Value>, Collator<C>> for Range<BV>
-where
-    BV: Borrow<C::Value>,
-    C: Collate,
-    C::Value: fmt::Debug,
-{
-    fn overlaps_value(&self, key: &Vec<C::Value>, collator: &Collator<C>) -> Overlap {
+impl<BV> Range<BV> {
+    fn overlaps_key<C>(&self, key: &[C::Value], collator: &Collator<C>) -> Overlap
+    where
+        BV: Borrow<C::Value>,
+        C: Collate,
+    {
         match collator.cmp_slices(&self.prefix, key) {
             Ordering::Less => Overlap::Less,
             Ordering::Greater => Overlap::Greater,
@@ -204,14 +231,8 @@ where
                 };
 
                 match (start, end) {
-                    (start, Ordering::Less) => {
-                        debug_assert!(start != Ordering::Greater);
-                        Overlap::Less
-                    }
-                    (Ordering::Greater, end) => {
-                        debug_assert_eq!(end, Ordering::Greater);
-                        Overlap::Greater
-                    }
+                    (_, Ordering::Less) => Overlap::Less,
+                    (Ordering::Greater, _) => Overlap::Greater,
                     (Ordering::Equal, Ordering::Equal) if key.len() == self.prefix.len() + 1 => {
                         // in this case, the range prefix of length n is exactly equal to key[0..n]
                         // and the trailing range is exactly equal to key[n]
@@ -224,74 +245,36 @@ where
     }
 }
 
+impl<BV, C> OverlapsValue<Vec<C::Value>, Collator<C>> for Range<BV>
+where
+    BV: Borrow<C::Value>,
+    C: Collate,
+    C::Value: fmt::Debug,
+{
+    fn overlaps_value(&self, key: &Vec<C::Value>, collator: &Collator<C>) -> Overlap {
+        self.overlaps_key(key, collator)
+    }
+}
+
 impl<C: Collate> OverlapsRange<Range<C::Value>, Collator<C>> for Range<C::Value> {
     fn overlaps(&self, other: &Range<C::Value>, collator: &Collator<C>) -> Overlap {
-        #[inline]
-        fn cmp_start<C>(collator: &C, bound: &Bound<C::Value>, value: &C::Value) -> Ordering
-        where
-            C: Collate,
-        {
-            match bound {
-                Bound::Unbounded => Ordering::Less,
-                Bound::Included(start) => collator.cmp(start, value),
-                Bound::Excluded(start) => match collator.cmp(start, value) {
-                    Ordering::Less | Ordering::Equal => Ordering::Less,
-                    Ordering::Greater => Ordering::Greater,
-                },
-            }
-        }
-
-        #[inline]
-        fn cmp_end<C>(collator: &C, bound: &Bound<C::Value>, value: &C::Value) -> Ordering
-        where
-            C: Collate,
-        {
-            match bound {
-                Bound::Unbounded => Ordering::Less,
-                Bound::Included(end) => collator.cmp(end, value),
-                Bound::Excluded(end) => match collator.cmp(end, value) {
-                    Ordering::Less => Ordering::Less,
-                    Ordering::Greater | Ordering::Equal => Ordering::Greater,
-                },
-            }
-        }
-
         match collator.cmp_slices(&self.prefix, &other.prefix) {
             Ordering::Less => Overlap::Less,
             Ordering::Greater => Overlap::Greater,
             Ordering::Equal => match self.prefix.len().cmp(&other.prefix.len()) {
-                Ordering::Less => {
-                    let value = &other.prefix[self.prefix.len()];
-
-                    match (
-                        cmp_start(&collator.value, &self.start, value),
-                        cmp_end(&collator.value, &self.end, value),
-                    ) {
-                        (Ordering::Greater, _) => Overlap::Greater,
-                        (_, Ordering::Less) => Overlap::Less,
-
-                        (Ordering::Equal, Ordering::Greater) => Overlap::WideGreater,
-                        (Ordering::Less, Ordering::Equal) => Overlap::WideLess,
-
-                        (Ordering::Less, Ordering::Greater) => Overlap::Wide,
-                        (Ordering::Equal, Ordering::Equal) => Overlap::Wide,
-                    }
-                }
+                Ordering::Less => match self.overlaps_key(&other.prefix, collator) {
+                    Overlap::Less => Overlap::Less,
+                    Overlap::Greater => Overlap::Greater,
+                    _ => Overlap::Wide,
+                },
                 Ordering::Equal => {
                     (&self.start, &self.end).overlaps(&(&other.start, &other.end), &collator.value)
                 }
-                Ordering::Greater => {
-                    let value = &self.prefix[other.prefix.len()];
-
-                    match (
-                        cmp_start(&collator.value, &other.start, value),
-                        cmp_end(&collator.value, &other.end, value),
-                    ) {
-                        (Ordering::Greater, _) => Overlap::Less,
-                        (_, Ordering::Less) => Overlap::Greater,
-                        _ => Overlap::Narrow,
-                    }
-                }
+                Ordering::Greater => match other.overlaps_key(&self.prefix, collator) {
+                    Overlap::Less => Overlap::Greater,
+                    Overlap::Greater => Overlap::Less,
+                    _ => Overlap::Narrow,
+                },
             },
         }
     }

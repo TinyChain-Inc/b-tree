@@ -2,6 +2,10 @@
 
 A persistent B+ tree using freqfs
 
+First, last, and emptiness share the same validated edge traversal. First and
+last return owned rows; emptiness consumes only presence and does not copy the
+matching row. Storage guards remain scoped to traversal.
+
 Use async `BTreeLock::create` for empty delegated storage, awaiting cache admission
 for its root, and `BTreeLock::load` for an existing tree. Loading never creates a
 missing root. Synchronize a newly created tree before relying on reopening it
@@ -21,6 +25,10 @@ cancellation may therefore leave incomplete storage which loading rejects.
 `validate()` owns whole-tree structural, ordering, and identity checks. `copy_into()`
 copies reachable nodes into empty delegated storage; callers coordinate source
 access. Neither introduces immutable root generations or version reclamation.
+
+Ordinary readers validate the width of each visited leaf before selection,
+counting, or borrowed callbacks. Malformed stored rows return typed integrity
+errors; native callers own recovery. Full structural validation remains separate.
 
 Leaves own complete values. Each internal node owns one routing separator between
 neighboring children, so it has one more child than separator. Separators retain
@@ -57,9 +65,18 @@ number inserted, and retains bounded traversal state. Errors or cancellation may
 leave an inserted prefix; callers own unpublished construction and recovery.
 
 Key streams copy the selected rows from one leaf before yielding them, releasing
-its payload guard. This conversion is synchronous; node traversal owns read
-concurrency. Ordered insertion checks duplicates across the equivalent group
-when the next input ties the previous collation.
+its payload guard. `select` uses the same traversal and copies only requested
+columns, preserving row multiplicity and range filtering on complete keys.
+This conversion is synchronous; node traversal owns read concurrency.
+`visit` uses that traversal to lend complete rows to a synchronous callback,
+including callbacks and range values borrowed from the caller. The callback
+cannot retain row references or reacquire storage protected by the tree owner.
+It may stop with `ControlFlow::Break`; all scan-owned guards are released on
+completion, error, cancellation, or early stop. Owned streams remain independent
+of callback lifetimes and continue releasing leaf guards before yielding values.
+
+Ordered insertion checks duplicates across the equivalent group when the next
+input ties the previous collation.
 
 [`BTreeWriteGuard::replace`](https://docs.rs/b-tree/latest/b_tree/struct.BTree.html#method.replace)
 changes one row in place while preserving its position and the tree topology.
@@ -71,10 +88,18 @@ replacement, and stream decoding. The module root owns public handles and shared
 node access; operation-specific helpers remain with their operation.
 
 `get(prefix)` resolves one semantic prefix and rejects multiple matching rows.
+`get_with(prefix, callback)` lends the unique row after completing the same check,
+so missing or ambiguous rows never invoke the callback. It releases lookup guards
+before reacquiring the selected leaf, trading one additional read for avoiding
+value clones. The owned `get` retains its existing acquisition count.
 `contains`, insertion, deletion, and replacement search equivalent groups without
 collecting them; traversal retains a path proportional to tree height. Ranges and
 stream grouping retain their collation-based meaning. Collators must order equal
 values equally, but may group unequal values.
+
+Range containment includes descendant prefixes only when the ancestor's bounds
+include their fixed column value. Included and excluded endpoints use the same
+comparison for keys and descendant ranges; equal-length prefixes compare bounds.
 
 Equivalent-group navigation reuses acquired leaf guards and retains only a
 root-to-leaf path. Lookup is linear in the size of a collation-equivalent group;
@@ -85,3 +110,43 @@ values belong to the same group, and releases read guards before publication.
 The executable example shares its schema and file adapters from `examples/support/`.
 Regression tests live in modules under `tests/native/`, compiled as one `native`
 integration target; test-only observations and directory fixtures live in `tests/common/`.
+
+Native range streams can borrow storage within a scope; the owned `Keys` alias
+continues to retain static ownership. `BTree::as_ref` borrows the storage owner
+instead of cloning its lock. Ordinary traversal detects ancestor cycles before
+descending. Count retains bounded child IDs and releases parent access before
+reading children, including with one available I/O slot.
+
+Visited index nodes validate separator/child cardinality, schema-valid prefixes,
+and nondecreasing separator order before routing or mutation. These local checks
+use no child reads; strict validation additionally checks occupancy, ancestry,
+and subtree boundaries. Malformed stored nodes return marked integrity errors;
+native libraries do not select host termination policy.
+
+Lazy scan, projection, and borrowed-visit methods now require schemas
+that are `Send + Sync`. Retained streams keep their schema: owned streams share
+the existing schema owner, while scoped visits borrow it. Scoped streams require
+only that their schema outlive the result; they do not impose `'static` on all
+schemas. Point reads retain their existing schema bounds. This is a public Rust
+bound change, without a storage-format change or alternate traversal path.
+
+Native mutations use insertion, replacement, deletion, and truncation. Cross-tree
+`merge` and `delete_all`, and unique-prefix `groups` streams, are no longer public
+capabilities. Ordinary key scans, column projection, borrowed consumption,
+ordered construction, and independent storage copying remain available.
+
+Each visited index node rejects repeated child IDs through the shared local
+validator; collation-equivalent separator keys remain supported. Ordered insertion
+uses the same leaf-width validation as ordinary reads, including after input polling
+before append, and checks ancestry during its rightmost descent. Malformed acquired
+nodes return marked integrity errors before their contents are used. Index uniqueness
+checks use a transient node-sized set of borrowed IDs; rightmost descent retains
+only its ancestry IDs, without payload copies or a persistent node registry.
+
+Fresh mutation-node acquisition shares the leaf-width and local index validators
+used by reads, including siblings acquired only for deletion rebalancing. Recursive
+mutations rely on that boundary rather than repeating the same checks. Nodes
+already held by deletion may be transiently underfull; acquisition adds no occupancy
+or whole-tree validation. A late sibling error rejects consumption of that sibling,
+but earlier local changes may already have occurred. Native callers remain
+responsible for recovery after interrupted or failed mutation.
