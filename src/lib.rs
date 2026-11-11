@@ -8,16 +8,14 @@ use std::fmt;
 
 use collate::{Collate, CollateRef};
 
-mod group;
 mod node;
 mod range;
 mod tree;
 
+pub use collate;
 pub use node::{Block, Node};
 pub use range::Range;
 pub use tree::{BTree, BTreeLock, BTreeReadGuard, BTreeWriteGuard, Keys};
-
-pub use collate;
 
 const NODE_STACK_SIZE: usize = 32;
 

@@ -5,8 +5,9 @@ use std::io;
 use collate::Collate;
 use freqfs::{DirWriteGuardOwned, FileLoad};
 use safecast::AsType;
+use uuid::Uuid;
 
-use super::{BTree, Node, Schema, validate_children, validate_key};
+use super::{BTree, Node, Schema, validate_index, validate_key};
 
 impl<S, C, FE> BTree<S, C, DirWriteGuardOwned<FE>>
 where
@@ -50,8 +51,7 @@ where
             .visit_equivalent(&replacement, |path, row| {
                 if row == previous {
                     if target.is_some() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
+                        return Err(freqfs::IntegrityError::invalid_data(
                             "duplicate semantic row",
                         ));
                     }
@@ -75,8 +75,7 @@ where
             self.visit_equivalent(previous, |path, row| {
                 if row == previous {
                     if target.is_some() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
+                        return Err(freqfs::IntegrityError::invalid_data(
                             "duplicate semantic row",
                         ));
                     }
@@ -93,14 +92,17 @@ where
         replacement_check?;
 
         let &(id, slot) = path.last().expect("leaf path");
-        let node = self.dir.read_file(&id).await?;
+        let node = self
+            .dir
+            .read_file(id.hyphenated().encode_lower(&mut Uuid::encode_buffer()))
+            .await
+            .map_err(super::required_node_error)?;
         let Node::Leaf(rows) = &*node else {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "expected leaf"));
+            return Err(freqfs::IntegrityError::invalid_data("expected leaf"));
         };
 
         if rows.get(slot).is_none_or(|row| row.as_slice() != previous) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            return Err(freqfs::IntegrityError::invalid_data(
                 "replacement target changed",
             ));
         }
@@ -124,7 +126,7 @@ where
                     continue;
                 };
                 let Node::Leaf(rows) = &*neighbor else {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "expected leaf"));
+                    return Err(freqfs::IntegrityError::invalid_data("expected leaf"));
                 };
 
                 let neighbor_slot = neighbor_path.last().expect("neighbor path").1;
@@ -148,17 +150,25 @@ where
                     .position(|(target, neighbor)| target.1 != neighbor.1)
                     .expect("adjacent subtree divergence");
                 let boundary = path[level].1.min(neighbor_path[level].1);
-                let ancestor = self.dir.read_file(&path[level].0).await?;
+                let ancestor = self
+                    .dir
+                    .read_file(
+                        path[level]
+                            .0
+                            .hyphenated()
+                            .encode_lower(&mut Uuid::encode_buffer()),
+                    )
+                    .await
+                    .map_err(super::required_node_error)?;
                 let Node::Index(separators, children) = &*ancestor else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
+                    return Err(freqfs::IntegrityError::invalid_data(
                         "expected index ancestor",
                     ));
                 };
 
-                validate_children(separators, children)?;
+                validate_index(&*self.schema, &self.collator, separators, children)?;
                 let separator = separators.get(boundary).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "missing replacement separator")
+                    freqfs::IntegrityError::invalid_data("missing replacement separator")
                 })?;
                 let previous_order = self.collator.cmp_routing(previous, separator);
                 let neighbor_order = self.collator.cmp_routing(neighbor_row, separator);
@@ -168,8 +178,7 @@ where
                 } else {
                     previous_order.is_lt() || neighbor_order.is_gt()
                 } {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
+                    return Err(freqfs::IntegrityError::invalid_data(
                         "invalid replacement separator",
                     ));
                 }
@@ -212,14 +221,12 @@ where
 
         while let Some(&(level, _, _, _)) = boundaries.peek() {
             let node = self.write_node(&path[level].0).await?;
-            let Node::Index(separators, children) = &*node else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
+            let Node::Index(separators, _) = &*node else {
+                return Err(freqfs::IntegrityError::invalid_data(
                     "expected index ancestor",
                 ));
             };
 
-            validate_children(separators, children)?;
             let mut changes = Vec::with_capacity(2);
             while boundaries
                 .peek()
@@ -228,8 +235,7 @@ where
                 let (_, slot, previous, replacement) =
                     boundaries.next().expect("prepared separator");
                 if separators.get(slot) != Some(&previous) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
+                    return Err(freqfs::IntegrityError::invalid_data(
                         "replacement separator changed",
                     ));
                 }
@@ -241,12 +247,11 @@ where
 
         let mut leaf = self.write_node(&id).await?;
         let Node::Leaf(rows) = &mut *leaf else {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "expected leaf"));
+            return Err(freqfs::IntegrityError::invalid_data("expected leaf"));
         };
 
         if rows.get(slot).is_none_or(|row| row.as_slice() != previous) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            return Err(freqfs::IntegrityError::invalid_data(
                 "replacement target changed",
             ));
         }

@@ -1,5 +1,6 @@
 use std::io;
 
+use b_tree::{BTreeLock, Range, Schema};
 use collate::Collator;
 use freqfs::Cache;
 use futures::TryStreamExt;
@@ -8,7 +9,6 @@ use smallvec::smallvec;
 
 use self::adapters::{ExampleSchema, File};
 use self::directory::TestDir;
-use b_tree::{BTreeLock, Range, Schema};
 
 #[path = "support/adapters.rs"]
 mod adapters;
@@ -146,37 +146,6 @@ async fn functional_test() -> Result<(), io::Error> {
                     i -= 1;
                 }
                 assert_eq!(i, 0);
-            }
-
-            {
-                let mut groups = view
-                    .clone()
-                    .groups(Range::from_prefix(smallvec![1]), 2, false)
-                    .await?;
-
-                assert_eq!(groups.try_next().await?, Some(smallvec![1, i16::MAX - 1]));
-                assert_eq!(groups.try_next().await?, None);
-
-                let mut i = 1i16;
-                let mut groups = view
-                    .clone()
-                    .groups(Range::<i16>::default(), 1, false)
-                    .await?;
-
-                while let Some(group) = groups.try_next().await? {
-                    assert_eq!(group.as_slice(), &[i]);
-                    i += 1;
-                }
-
-                let mut groups = view
-                    .clone()
-                    .groups(Range::<i16>::default(), 1, true)
-                    .await?;
-
-                while let Some(group) = groups.try_next().await? {
-                    i -= 1;
-                    assert_eq!(group.as_slice(), &[i]);
-                }
             }
 
             std::mem::drop(view);

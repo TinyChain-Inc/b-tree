@@ -1,17 +1,17 @@
 //! Ordinary and ordered insertion share splitting and ancestor propagation.
 
 use std::cmp::Ordering;
-use std::{io, mem, pin::Pin};
+use std::pin::Pin;
+use std::{io, mem};
 
 use collate::Collate;
-use freqfs::{DirDeref, DirWriteGuardOwned, FileLoad, FileReadGuard, FileWriteGuardOwned};
+use freqfs::{DirWriteGuardOwned, FileLoad, FileReadGuard, FileWriteGuardOwned};
 use futures::future::Future;
 use futures::stream::{Stream, TryStreamExt};
 use safecast::AsType;
 use uuid::Uuid;
 
-use super::{BTree, Node, ROOT, Schema, validate_collator_eq, validate_key, validate_schema_eq};
-use crate::range::Range;
+use super::{BTree, Node, ROOT, Schema, validate_key, validate_rows};
 
 type ResultInsert<V> = Result<Insert<V>, io::Error>;
 
@@ -112,17 +112,33 @@ where
 
     async fn rightmost_leaf(&self) -> Result<(Uuid, FileReadGuard<'_, Node<S::Value>>), io::Error> {
         let mut id = ROOT;
+        let mut ancestors = Vec::new();
 
         loop {
-            let node = self.dir.read_file::<_, Node<S::Value>>(&id).await?;
+            if ancestors.contains(&id) {
+                return Err(freqfs::IntegrityError::invalid_data(
+                    "cycle in BTree ancestry",
+                ));
+            }
+            ancestors.push(id);
+            let node = self
+                .dir
+                .read_file::<Node<S::Value>>(
+                    id.hyphenated().encode_lower(&mut Uuid::encode_buffer()),
+                )
+                .await
+                .map_err(super::required_node_error)?;
 
             match &*node {
-                Node::Leaf(_) => return Ok((id, node)),
+                Node::Leaf(rows) => {
+                    validate_rows(rows, self.schema.len())?;
+                    return Ok((id, node));
+                }
                 Node::Index(separators, children) => {
-                    super::validate_children(separators, children)?;
-                    id = *children.last().ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "empty BTree index")
-                    })?;
+                    super::validate_index(&*self.schema, &self.collator, separators, children)?;
+                    id = *children
+                        .last()
+                        .ok_or_else(|| freqfs::IntegrityError::invalid_data("empty BTree index"))?;
                 }
             }
         }
@@ -170,7 +186,6 @@ where
                     (separator, Node::Leaf(right))
                 }
                 Node::Index(separators, children) => {
-                    super::validate_children(separators, children)?;
                     let mut child = self.write_node(&children[slot]).await?;
                     let result = self.insert_inner(&mut child, key, &path[1..]).await?;
                     drop(child);
@@ -199,30 +214,5 @@ where
             let (right, _) = self.dir.create_file_unique(right).await?;
             Ok(Insert::Split(separator, right))
         })
-    }
-}
-
-impl<S, C, FE> BTree<S, C, DirWriteGuardOwned<FE>>
-where
-    S: Schema + Send + Sync,
-    C: Collate<Value = S::Value> + Clone + Send + Sync + 'static,
-    FE: AsType<Node<S::Value>> + Send + Sync + 'static + FileLoad,
-{
-    /// Merge the keys from the `other` B+Tree range into this one.
-    ///
-    /// The source B+Tree **must** have an identical schema and collation.
-    pub async fn merge<G>(&mut self, other: BTree<S, C, G>) -> Result<(), io::Error>
-    where
-        G: DirDeref<Entry = FE> + Clone + Send + Sync + 'static,
-    {
-        validate_collator_eq(&self.collator, &other.collator)?;
-        validate_schema_eq(&self.schema, &other.schema)?;
-
-        let mut keys = other.keys(Range::<S::Value>::default()).await?;
-        while let Some(key) = keys.try_next().await? {
-            self.insert_root(key.into_vec()).await?;
-        }
-
-        Ok(())
     }
 }

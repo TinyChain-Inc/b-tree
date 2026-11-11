@@ -1,19 +1,16 @@
 //! Deletion owns borrowing, merging, and root collapse.
 
 use std::borrow::Borrow;
-use std::{io, mem, pin::Pin};
+use std::pin::Pin;
+use std::{io, mem};
 
 use collate::Collate;
-use freqfs::{DirDeref, DirWriteGuardOwned, FileLoad, FileWriteGuardOwned};
-use futures::TryStreamExt;
+use freqfs::{DirWriteGuardOwned, FileLoad, FileWriteGuardOwned};
 use futures::future::Future;
 use safecast::AsType;
 use uuid::Uuid;
 
-use super::{
-    BTree, Node, ROOT, Schema, validate_children, validate_collator_eq, validate_schema_eq,
-};
-use crate::range::Range;
+use super::{BTree, Node, ROOT, Schema};
 
 impl<S, C, FE> BTree<S, C, DirWriteGuardOwned<FE>>
 where
@@ -39,8 +36,7 @@ where
         let only_child = match &*root {
             Node::Index(separators, children) if children.len() == 1 => {
                 if !separators.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
+                    return Err(freqfs::IntegrityError::invalid_data(
                         "invalid root separators",
                     ));
                 }
@@ -61,7 +57,9 @@ where
                 }
             };
 
-            self.dir.delete(&id).await;
+            self.dir
+                .delete(id.hyphenated().encode_lower(&mut Uuid::encode_buffer()))
+                .await;
             *root = contents;
         }
 
@@ -92,7 +90,6 @@ where
                     }
                 }
                 Node::Index(separators, children) => {
-                    validate_children(separators, children)?;
                     let mut child = self.write_node(&children[slot]).await?;
                     if !self.delete_inner(&mut child, key, &path[1..]).await? {
                         return Ok(false);
@@ -113,7 +110,9 @@ where
 
                     drop(child);
                     if let Some(id) = retired {
-                        self.dir.delete(&id).await;
+                        self.dir
+                            .delete(id.hyphenated().encode_lower(&mut Uuid::encode_buffer()))
+                            .await;
                     }
 
                     // Removing a leaf value does not invalidate a routing separator.
@@ -162,8 +161,7 @@ where
             (Node::Index(left, left_children), Node::Index(right, right_children)) => {
                 if left.len() + 1 != left_children.len() || right.len() + 1 != right_children.len()
                 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
+                    return Err(freqfs::IntegrityError::invalid_data(
                         "invalid sibling separators",
                     ));
                 }
@@ -193,8 +191,7 @@ where
                 left_children.append(right_children);
             }
             _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
+                return Err(freqfs::IntegrityError::invalid_data(
                     "unequal sibling depths",
                 ));
             }
@@ -207,38 +204,14 @@ where
     pub async fn truncate(&mut self) -> Result<(), io::Error> {
         self.dir.truncate().await;
         self.dir
-            .create_empty_file(ROOT.to_string(), Node::Leaf(vec![]))
+            .create_file(ROOT.to_string(), Node::Leaf(vec![]))
             .await?;
 
         debug_assert!(
-            self.dir.contains(&ROOT),
+            self.dir
+                .contains(ROOT.hyphenated().encode_lower(&mut Uuid::encode_buffer())),
             "B+Tree failed to re-create its root node"
         );
-        Ok(())
-    }
-}
-
-impl<S, C, FE> BTree<S, C, DirWriteGuardOwned<FE>>
-where
-    S: Schema + Send + Sync,
-    C: Collate<Value = S::Value> + Clone + Send + Sync + 'static,
-    FE: AsType<Node<S::Value>> + Send + Sync + 'static + FileLoad,
-{
-    /// Delete the keys in the `other` B+Tree from this one.
-    ///
-    /// The source B+Tree **must** have an identical schema and collation.
-    pub async fn delete_all<G>(&mut self, other: BTree<S, C, G>) -> Result<(), io::Error>
-    where
-        G: DirDeref<Entry = FE> + Clone + Send + Sync + 'static,
-    {
-        validate_collator_eq(&self.collator, &other.collator)?;
-        validate_schema_eq(&self.schema, &other.schema)?;
-
-        let mut keys = other.keys(Range::<S::Value>::default()).await?;
-        while let Some(key) = keys.try_next().await? {
-            self.delete(&key).await?;
-        }
-
         Ok(())
     }
 }

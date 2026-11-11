@@ -63,8 +63,8 @@ async fn in_place_splits_merges_copy_and_reopening() -> Result<(), io::Error> {
                     let target = copy_dir.read().await;
                     assert_eq!(source.len(), target.len());
                     for name in source.names() {
-                        let source = source.read_file::<_, Node<Vec<Vec<i16>>>>(name).await?;
-                        let target = target.read_file::<_, Node<Vec<Vec<i16>>>>(name).await?;
+                        let source = source.read_file::<Node<Vec<Vec<i16>>>>(name).await?;
+                        let target = target.read_file::<Node<Vec<Vec<i16>>>>(name).await?;
                         match (&*source, &*target) {
                             (Node::Leaf(left), Node::Leaf(right)) => assert_eq!(left, right),
                             (
@@ -98,7 +98,12 @@ async fn in_place_splits_merges_copy_and_reopening() -> Result<(), io::Error> {
                     let contents = copy_dir.write().await;
                     let malformed = Node::Index(vec![vec![90]], vec![root]);
 
-                    *contents.write_file::<_, Node<Vec<Vec<i16>>>>(&root).await? = malformed;
+                    *contents
+                        .write_file::<Node<Vec<Vec<i16>>>>(
+                            root.hyphenated()
+                                .encode_lower(&mut uuid::Uuid::encode_buffer()),
+                        )
+                        .await? = malformed;
                 }
                 assert!(copy.validate().await.is_err());
                 reopened.write().await.create_dir("unexpected".into())?;
@@ -177,10 +182,6 @@ async fn compact_separators_preserve_complete_rows_and_boundaries() -> io::Resul
                 assert!(
                     matches!(view.clone().keys_rev(range.clone()).await, Err(error) if error.kind() == io::ErrorKind::InvalidInput),
                     "{name}: reverse keys"
-                );
-                assert!(
-                    matches!(view.clone().groups(range, 1, false).await, Err(error) if error.kind() == io::ErrorKind::InvalidInput),
-                    "{name}: groups"
                 );
             }
         }
@@ -294,8 +295,24 @@ async fn compact_separators_preserve_complete_rows_and_boundaries() -> io::Resul
         drop(cycle);
         {
             let mut files = dir.write().await;
-            assert!(files.delete(&cycle_id).await);
-            assert!(files.delete(&leaf_id).await);
+            assert!(
+                files
+                    .delete(
+                        cycle_id
+                            .hyphenated()
+                            .encode_lower(&mut uuid::Uuid::encode_buffer())
+                    )
+                    .await
+            );
+            assert!(
+                files
+                    .delete(
+                        leaf_id
+                            .hyphenated()
+                            .encode_lower(&mut uuid::Uuid::encode_buffer())
+                    )
+                    .await
+            );
         }
         tree.validate().await?;
         tree.sync_all().await?;
@@ -419,4 +436,147 @@ async fn load_requires_existing_root() -> Result<(), io::Error> {
     }
 
     fixture.close()
+}
+
+#[tokio::test]
+async fn deletion_validates_siblings_before_rebalancing() -> io::Result<()> {
+    for internal in [false, true] {
+        for target_right in [false, true] {
+            for lending in [false, true] {
+                for malformed in [false, true] {
+                    let fixture = TestDir::new("btree_rebalance_sibling")?;
+                    {
+                        let dir = Cache::<File>::new(
+                            1024 * 1024,
+                            Some(4),
+                            0,
+                            std::time::Duration::from_secs(3),
+                        )
+                        .load(fixture.path().to_owned())?;
+                        let tree = BTreeLock::create(
+                            ExampleSchema::<i16>::new(1),
+                            Collator::default(),
+                            dir.clone(),
+                        )
+                        .await?;
+                        let ids = [1, 2].map(uuid::Uuid::from_u128);
+                        let target = usize::from(target_right);
+                        let sibling = ids[1 - target];
+                        let mut expected = Vec::new();
+                        {
+                            let mut native = dir.write().await;
+                            for (side, id) in ids.iter().enumerate() {
+                                let base = (side * 100) as i16;
+                                let count = if side == target {
+                                    if internal { 3 } else { 2 }
+                                } else if internal {
+                                    if lending { 4 } else { 3 }
+                                } else if lending {
+                                    3
+                                } else {
+                                    2
+                                };
+                                let node = if internal {
+                                    let mut children = Vec::new();
+                                    let mut separators = Vec::new();
+                                    for offset in 0..count {
+                                        let child = uuid::Uuid::from_u128(
+                                            10 + (side * 10 + offset) as u128,
+                                        );
+                                        let first = base + (offset * 2) as i16;
+                                        let rows = vec![vec![first], vec![first + 1]];
+                                        expected.extend(rows.iter().cloned());
+                                        native
+                                            .create_file(child.to_string(), Node::Leaf(rows))
+                                            .await?;
+                                        children.push(child);
+                                        if offset > 0 {
+                                            separators.push(vec![first]);
+                                        }
+                                    }
+                                    Node::Index(separators, children)
+                                } else {
+                                    let rows: Vec<_> = (0..count)
+                                        .map(|offset| vec![base + offset as i16])
+                                        .collect();
+                                    expected.extend(rows.iter().cloned());
+                                    Node::Leaf(rows)
+                                };
+                                native.create_file(id.to_string(), node).await?;
+                            }
+                            *native
+                                .write_file::<Node<Vec<Vec<i16>>>>(&uuid::Uuid::nil().to_string())
+                                .await? = Node::Index(vec![vec![100]], ids.to_vec());
+                        }
+                        tree.validate().await?;
+                        let sibling_file = dir
+                            .read()
+                            .await
+                            .get_file(&sibling.to_string())
+                            .unwrap()
+                            .clone();
+                        if malformed {
+                            let mut node = sibling_file.write::<Node<Vec<Vec<i16>>>>().await?;
+                            match &mut *node {
+                                Node::Leaf(rows) => rows[0].clear(),
+                                Node::Index(_, children) => children[1] = children[0],
+                            }
+                        }
+                        let before = sibling_file.read::<Node<Vec<Vec<i16>>>>().await?.clone();
+                        let key = if target_right { 101 } else { 0 };
+                        // The corrupt sibling is outside the lookup path. It is
+                        // acquired only after the valid target becomes underfull.
+                        assert!(tree.read().await.contains(&[key]).await?);
+                        let result = tree.write().await.delete(&[key]).await;
+                        if malformed {
+                            let error = result.unwrap_err();
+                            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                            assert!(freqfs::IntegrityError::is_marked(&error));
+                            let after = sibling_file.read::<Node<Vec<Vec<i16>>>>().await?;
+                            match (&before, &*after) {
+                                (Node::Leaf(before), Node::Leaf(after)) => {
+                                    assert_eq!(before, after)
+                                }
+                                (
+                                    Node::Index(before, before_ids),
+                                    Node::Index(after, after_ids),
+                                ) => {
+                                    assert_eq!(before, after);
+                                    assert_eq!(before_ids, after_ids);
+                                }
+                                _ => panic!("rebalancing changed corrupt sibling kind"),
+                            }
+                            // Native mutation may already have removed the target;
+                            // the caller must recover rather than reuse this tree.
+                        } else {
+                            assert!(result?);
+                            tree.validate().await?;
+                            expected.retain(|row| row != &[key]);
+                            let actual: Vec<_> = tree
+                                .read()
+                                .await
+                                .keys(Range::<i16>::default())
+                                .await?
+                                .map_ok(|row| row.into_vec())
+                                .try_collect()
+                                .await?;
+                            assert_eq!(actual, expected);
+                            if !lending {
+                                // A merge collapses the old root in both depths.
+                                assert!(!dir.read().await.contains(&ids[0].to_string()));
+                                assert!(!dir.read().await.contains(&ids[1].to_string()));
+                            }
+                        }
+                        drop(tree.try_write()?);
+                        let native = dir.try_write()?;
+                        for file in native.files() {
+                            drop(file.try_write::<Node<Vec<Vec<i16>>>>()?);
+                        }
+                    }
+                    fixture.close()?;
+                }
+            }
+        }
+    }
+    Ok(())
 }

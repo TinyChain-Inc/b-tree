@@ -4,8 +4,9 @@
 //! operation modules.
 
 use std::collections::HashSet;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::{fmt, io, pin::Pin};
+use std::{fmt, io};
 
 use collate::Collate;
 use freqfs::{
@@ -112,10 +113,13 @@ where
 
         if nodes.is_empty() {
             nodes
-                .create_empty_file::<Node<S::Value>>(ROOT.to_string(), Node::Leaf(vec![]))
+                .create_file::<Node<S::Value>>(ROOT.to_string(), Node::Leaf(vec![]))
                 .await?;
 
-            debug_assert!(nodes.contains(&ROOT), "B+Tree failed to create a root node");
+            debug_assert!(
+                nodes.contains(ROOT.hyphenated().encode_lower(&mut Uuid::encode_buffer())),
+                "B+Tree failed to create a root node"
+            );
 
             Ok(Self::new(schema, collator, dir))
         } else {
@@ -131,11 +135,8 @@ where
         validate_order(schema.order())?;
         {
             let nodes = dir.try_read()?;
-            if !nodes.contains(&ROOT) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "missing B+Tree root",
-                ));
+            if !nodes.contains(ROOT.hyphenated().encode_lower(&mut Uuid::encode_buffer())) {
+                return Err(freqfs::IntegrityError::invalid_data("missing B+Tree root"));
             }
         }
 
@@ -253,7 +254,7 @@ where
 {
     /// Validate the complete selected tree before accepting storage.
     pub async fn validate(&self) -> Result<(), io::Error> {
-        let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
+        let invalid = |message| freqfs::IntegrityError::invalid_data(message);
         let tree = self.read().await;
         for (name, entry) in tree.dir.as_dir().iter() {
             if name.parse::<Uuid>().is_err() || !entry.is_file() {
@@ -274,8 +275,11 @@ where
             let node = tree
                 .dir
                 .as_dir()
-                .read_file::<_, Node<S::Value>>(&id)
-                .await?;
+                .read_file::<Node<S::Value>>(
+                    id.hyphenated().encode_lower(&mut Uuid::encode_buffer()),
+                )
+                .await
+                .map_err(required_node_error)?;
 
             // Collators only receive columns accepted by the owning schema.
             let keys = match &*node {
@@ -296,15 +300,18 @@ where
                         return Err(invalid("invalid BTree leaf"));
                     }
 
+                    if rows
+                        .windows(2)
+                        .any(|pair| self.collator.cmp_routing(&pair[0], &pair[1]).is_gt())
+                    {
+                        return Err(invalid("invalid BTree ordering or subtree boundary"));
+                    }
                     rows
                 }
                 Node::Index(separators, children) => {
-                    validate_children(separators, children)?;
+                    validate_index(&*self.schema, &self.collator, separators, children)?;
                     if children.len() > self.schema.order()
                         || (id != ROOT && children.len() < self.schema.order().div_ceil(2))
-                        || separators
-                            .iter()
-                            .any(|prefix| self.schema.validate_prefix(prefix).is_err())
                     {
                         return Err(invalid("invalid BTree separators"));
                     }
@@ -313,18 +320,13 @@ where
                 }
             };
 
-            if keys
-                .windows(2)
-                .any(|pair| self.collator.cmp_routing(&pair[0], &pair[1]).is_gt())
-                || lower.as_ref().is_some_and(|lower| {
-                    keys.first()
-                        .is_some_and(|first| self.collator.cmp_routing(first, lower).is_lt())
-                })
-                || upper.as_ref().is_some_and(|upper| {
-                    keys.last()
-                        .is_some_and(|last| self.collator.cmp_routing(last, upper).is_gt())
-                })
-            {
+            if lower.as_ref().is_some_and(|lower| {
+                keys.first()
+                    .is_some_and(|first| self.collator.cmp_routing(first, lower).is_lt())
+            }) || upper.as_ref().is_some_and(|upper| {
+                keys.last()
+                    .is_some_and(|last| self.collator.cmp_routing(last, upper).is_gt())
+            }) {
                 return Err(invalid("invalid BTree ordering or subtree boundary"));
             }
 
@@ -373,8 +375,11 @@ where
             let node = tree
                 .dir
                 .as_dir()
-                .read_file::<_, Node<S::Value>>(&id)
-                .await?;
+                .read_file::<Node<S::Value>>(
+                    id.hyphenated().encode_lower(&mut Uuid::encode_buffer()),
+                )
+                .await
+                .map_err(required_node_error)?;
 
             match &*node {
                 Node::Index(separators, children) => {
@@ -431,7 +436,7 @@ where
                     .copy_file_from(
                         name.clone(),
                         entry.as_file().ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidData, "invalid BTree node entry")
+                            freqfs::IntegrityError::invalid_data("invalid BTree node entry")
                         })?,
                     )
                     .await?;
@@ -472,6 +477,18 @@ where
     S: Schema,
     C: Collate<Value = S::Value>,
 {
+    /// Borrow the storage owner for a scoped read. Retained streams still own their storage.
+    pub fn as_ref(&self) -> BTree<S, C, &G>
+    where
+        C: Clone,
+    {
+        BTree {
+            schema: self.schema.clone(),
+            collator: self.collator.clone(),
+            dir: &self.dir,
+        }
+    }
+
     /// Borrow the [`Schema`] of this [`BTree`].
     pub fn schema(&self) -> &S {
         &self.schema
@@ -499,13 +516,36 @@ where
         &self,
         id: &Uuid,
     ) -> Result<FileWriteGuardOwned<FE, Node<S::Value>>, io::Error> {
-        self.dir.write_file_owned(id).await
+        // Validate every freshly acquired mutation node, including off-path
+        // siblings. Already-held nodes may become transiently underfull while
+        // rebalancing; occupancy and whole-tree checks belong to strict validation.
+        let node = self
+            .dir
+            .write_file_owned(id.hyphenated().encode_lower(&mut Uuid::encode_buffer()))
+            .await
+            .map_err(required_node_error)?;
+        match &*node {
+            Node::Leaf(rows) => validate_rows(rows, self.schema.len())?,
+            Node::Index(separators, children) => {
+                validate_index(&*self.schema, &self.collator, separators, children)?;
+            }
+        }
+
+        Ok(node)
     }
 }
 
 impl<S: fmt::Debug, C, G> fmt::Debug for BTree<S, C, G> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "B+Tree index with schema {:?}", self.schema)
+    }
+}
+
+// Only native node references establish that a missing file is corrupt storage.
+fn required_node_error(error: io::Error) -> io::Error {
+    match error.kind() {
+        io::ErrorKind::InvalidData | io::ErrorKind::NotFound => freqfs::IntegrityError::mark(error),
+        _ => error,
     }
 }
 
@@ -516,50 +556,56 @@ fn validate_key<S: Schema>(schema: &S, key: Vec<S::Value>) -> Result<Vec<S::Valu
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
 }
 
-#[inline]
-fn validate_collator_eq<S>(this: &S, that: &S) -> Result<(), io::Error>
-where
-    S: PartialEq,
-{
-    if this == that {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "B+Tree to merge must have the same collation",
+fn validate_rows<V>(rows: &[Vec<V>], width: usize) -> io::Result<()> {
+    if rows.iter().any(|row| row.len() != width) {
+        Err(freqfs::IntegrityError::invalid_data(
+            "stored row does not match the BTree schema",
         ))
+    } else {
+        Ok(())
     }
 }
 
-#[inline]
-fn validate_schema_eq<S>(this: &S, that: &S) -> Result<(), io::Error>
+// Check the complete local index before routing or modifying any child. This
+// requires no child reads; strict validation separately checks subtree bounds.
+fn validate_index<S, C>(
+    schema: &S,
+    collator: &Collator<C>,
+    separators: &[Vec<S::Value>],
+    children: &[Uuid],
+) -> io::Result<()>
 where
-    S: PartialEq + fmt::Debug,
+    S: Schema,
+    C: Collate<Value = S::Value>,
 {
-    if this == that {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "cannot merge a B+Tree with schema {:?} into one with schema {:?}",
-                that, this
-            ),
-        ))
-    }
-}
-
-// Internal nodes contain one routing separator between each pair of children.
-// In particular, this rejects the former child-minimum representation.
-fn validate_children<V>(separators: &[Vec<V>], children: &[Uuid]) -> io::Result<()> {
     if children.len() < 2 || separators.len() != children.len() - 1 {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+        return Err(freqfs::IntegrityError::invalid_data(
             "invalid BTree children",
-        ))
-    } else {
-        Ok(())
+        ));
     }
+
+    for prefix in separators {
+        schema.validate_prefix(prefix).map_err(|cause| {
+            freqfs::IntegrityError::mark(io::Error::new(io::ErrorKind::InvalidData, cause))
+        })?;
+    }
+
+    if separators
+        .windows(2)
+        .any(|pair| collator.cmp_routing(&pair[0], &pair[1]).is_gt())
+    {
+        return Err(freqfs::IntegrityError::invalid_data(
+            "invalid BTree ordering or subtree boundary",
+        ));
+    }
+    // Child identity is independent of separator collation. Reusing a child
+    // would make separate branches consume or mutate the same subtree.
+    let mut seen = HashSet::with_capacity(children.len());
+    if children.iter().any(|child| !seen.insert(child)) {
+        return Err(freqfs::IntegrityError::invalid_data("repeated BTree child"));
+    }
+
+    Ok(())
 }
 
 fn validate_order(order: usize) -> io::Result<()> {
