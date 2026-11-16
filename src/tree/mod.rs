@@ -3,10 +3,7 @@
 //! Reading, insertion, deletion, replacement, and decoding live in private
 //! operation modules.
 
-use std::collections::HashSet;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::{fmt, io};
+use std::{collections::HashSet, fmt, io, pin::Pin, sync::Arc};
 
 use collate::Collate;
 use freqfs::{
@@ -17,20 +14,24 @@ use futures::{FutureExt, Stream};
 use safecast::AsType;
 use uuid::Uuid;
 
-use super::{Collator, Key, Schema};
+use super::{IndexOrder, Key, RangeCollator, Schema};
 
 #[cfg(feature = "stream")]
 mod codec;
+
 mod delete;
+
 mod insert;
+
 mod read;
+
 mod replace;
 
 /// A read guard acquired on a [`BTreeLock`]
-pub type BTreeReadGuard<S, C, FE> = BTree<S, C, Arc<DirReadGuardOwned<FE>>>;
+pub type BTreeReadGuard<S, C, FE, O = C> = BTree<S, C, Arc<DirReadGuardOwned<FE>>, O>;
 
 /// A write guard acquired on a [`BTreeLock`]
-pub type BTreeWriteGuard<S, C, FE> = BTree<S, C, DirWriteGuardOwned<FE>>;
+pub type BTreeWriteGuard<S, C, FE, O = C> = BTree<S, C, DirWriteGuardOwned<FE>, O>;
 
 /// A stream of [`Key`]s in a [`BTree`]
 pub type Keys<V> = Pin<Box<dyn Stream<Item = Result<Key<V>, io::Error>> + Send>>;
@@ -62,29 +63,30 @@ impl<FE, V> AsRef<[Vec<V>]> for Leaf<FE, V> {
 }
 
 /// A futures-aware read-write lock on a [`BTree`]
-pub struct BTreeLock<S, C, FE> {
+pub struct BTreeLock<S, C, FE, O = C> {
     schema: Arc<S>,
-    collator: Collator<C>,
+    ordering: IndexOrder<C, O>,
     dir: DirLock<FE>,
 }
 
-impl<S, C, FE> Clone for BTreeLock<S, C, FE>
+impl<S, C, FE, O> Clone for BTreeLock<S, C, FE, O>
 where
     C: Clone,
+    O: Clone,
 {
     fn clone(&self) -> Self {
         Self {
             schema: self.schema.clone(),
-            collator: self.collator.clone(),
+            ordering: self.ordering.clone(),
             dir: self.dir.clone(),
         }
     }
 }
 
-impl<S, C, FE> BTreeLock<S, C, FE> {
-    /// Borrow the [`Collator`] used by this B+Tree.
-    pub fn collator(&self) -> &Collator<C> {
-        &self.collator
+impl<S, C, FE, O> BTreeLock<S, C, FE, O> {
+    /// Borrow the [`IndexOrder`] used by this B+Tree.
+    pub fn ordering(&self) -> &IndexOrder<C, O> {
+        &self.ordering
     }
 
     /// Borrow the schema of the source B+Tree.
@@ -93,21 +95,25 @@ impl<S, C, FE> BTreeLock<S, C, FE> {
     }
 }
 
-impl<S, C, FE> BTreeLock<S, C, FE>
+impl<S, C, FE, O> BTreeLock<S, C, FE, O>
 where
     S: Schema,
     FE: AsType<Node<S::Value>> + From<Node<S::Value>> + Send + Sync + FileLoad,
 {
-    fn new(schema: S, collator: C, dir: DirLock<FE>) -> Self {
+    fn new(schema: S, ordering: IndexOrder<C, O>, dir: DirLock<FE>) -> Self {
         Self {
             schema: Arc::new(schema),
-            collator: Collator::new(collator),
+            ordering,
             dir,
         }
     }
 
     /// Create a new [`BTreeLock`], awaiting admission of its root in `dir`.
-    pub async fn create(schema: S, collator: C, dir: DirLock<FE>) -> Result<Self, io::Error> {
+    pub async fn create(
+        schema: S,
+        ordering: IndexOrder<C, O>,
+        dir: DirLock<FE>,
+    ) -> Result<Self, io::Error> {
         validate_order(schema.order())?;
         let mut nodes = dir.try_write_owned()?;
 
@@ -121,7 +127,7 @@ where
                 "B+Tree failed to create a root node"
             );
 
-            Ok(Self::new(schema, collator, dir))
+            Ok(Self::new(schema, ordering, dir))
         } else {
             Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -130,8 +136,12 @@ where
         }
     }
 
-    /// Load a [`BTreeLock`] with the given `schema` and `collator` from `dir`.
-    pub fn load(schema: S, collator: C, dir: DirLock<FE>) -> Result<Self, io::Error> {
+    /// Load a [`BTreeLock`] with the given `schema` and `ordering` from `dir`.
+    pub fn load(
+        schema: S,
+        ordering: IndexOrder<C, O>,
+        dir: DirLock<FE>,
+    ) -> Result<Self, io::Error> {
         validate_order(schema.order())?;
         {
             let nodes = dir.try_read()?;
@@ -140,7 +150,7 @@ where
             }
         }
 
-        Ok(Self::new(schema, collator, dir))
+        Ok(Self::new(schema, ordering, dir))
     }
 
     /// Write any modified blocks of thie [`BTree`] to the filesystem.
@@ -160,13 +170,14 @@ where
     }
 }
 
-impl<S, C, FE> BTreeLock<S, C, FE>
+impl<S, C, FE, O> BTreeLock<S, C, FE, O>
 where
     C: Clone,
+    O: Clone,
     FE: Send + Sync,
 {
     /// Lock this B+Tree for reading, without borrowing.
-    pub async fn into_read(self) -> BTreeReadGuard<S, C, FE> {
+    pub async fn into_read(self) -> BTreeReadGuard<S, C, FE, O> {
         #[cfg(feature = "logging")]
         log::debug!("lock B+Tree at {:?} for reading...", self.dir);
 
@@ -175,14 +186,14 @@ where
             .map(Arc::new)
             .map(|dir| BTree {
                 schema: self.schema.clone(),
-                collator: self.collator.clone(),
+                ordering: self.ordering.clone(),
                 dir,
             })
             .await
     }
 
     /// Lock this B+Tree for reading.
-    pub async fn read(&self) -> BTreeReadGuard<S, C, FE> {
+    pub async fn read(&self) -> BTreeReadGuard<S, C, FE, O> {
         #[cfg(feature = "logging")]
         log::debug!("lock B+Tree at {:?} for reading...", self.dir);
 
@@ -191,23 +202,23 @@ where
             .map(Arc::new)
             .map(|dir| BTree {
                 schema: self.schema.clone(),
-                collator: self.collator.clone(),
+                ordering: self.ordering.clone(),
                 dir,
             })
             .await
     }
 
     /// Lock this B+Tree for reading synchronously, if possible.
-    pub fn try_read(&self) -> Result<BTreeReadGuard<S, C, FE>, io::Error> {
+    pub fn try_read(&self) -> Result<BTreeReadGuard<S, C, FE, O>, io::Error> {
         self.dir.try_read_owned().map(Arc::new).map(|dir| BTree {
             schema: self.schema.clone(),
-            collator: self.collator.clone(),
+            ordering: self.ordering.clone(),
             dir,
         })
     }
 
     /// Lock this B+Tree for writing, without borrowing.
-    pub async fn into_write(self) -> BTreeWriteGuard<S, C, FE> {
+    pub async fn into_write(self) -> BTreeWriteGuard<S, C, FE, O> {
         #[cfg(feature = "logging")]
         log::debug!("lock B+Tree at {:?} for writing...", self.dir);
 
@@ -215,14 +226,14 @@ where
             .into_write()
             .map(|dir| BTree {
                 schema: self.schema.clone(),
-                collator: self.collator.clone(),
+                ordering: self.ordering.clone(),
                 dir,
             })
             .await
     }
 
     /// Lock this B+Tree for writing.
-    pub async fn write(&self) -> BTreeWriteGuard<S, C, FE> {
+    pub async fn write(&self) -> BTreeWriteGuard<S, C, FE, O> {
         #[cfg(feature = "logging")]
         log::debug!("lock B+Tree at {:?} for writing...", self.dir);
 
@@ -230,26 +241,27 @@ where
             .write_owned()
             .map(|dir| BTree {
                 schema: self.schema.clone(),
-                collator: self.collator.clone(),
+                ordering: self.ordering.clone(),
                 dir,
             })
             .await
     }
 
     /// Lock this B+Tree for writing synchronously, if possible.
-    pub fn try_write(&self) -> Result<BTreeWriteGuard<S, C, FE>, io::Error> {
+    pub fn try_write(&self) -> Result<BTreeWriteGuard<S, C, FE, O>, io::Error> {
         self.dir.try_write_owned().map(|dir| BTree {
             schema: self.schema.clone(),
-            collator: self.collator.clone(),
+            ordering: self.ordering.clone(),
             dir,
         })
     }
 }
 
-impl<S, C, FE> BTreeLock<S, C, FE>
+impl<S, C, FE, O> BTreeLock<S, C, FE, O>
 where
     S: Schema + Send + Sync,
     C: Collate<Value = S::Value> + Clone + Send + Sync,
+    O: Collate<Value = S::Value> + Clone + Send + Sync,
     FE: AsType<Node<S::Value>> + Send + Sync + FileLoad,
 {
     /// Validate the complete selected tree before accepting storage.
@@ -302,14 +314,19 @@ where
 
                     if rows
                         .windows(2)
-                        .any(|pair| self.collator.cmp_routing(&pair[0], &pair[1]).is_gt())
+                        .any(|pair| self.ordering.key_collator().cmp(&pair[0], &pair[1]).is_gt())
                     {
                         return Err(invalid("invalid BTree ordering or subtree boundary"));
                     }
                     rows
                 }
                 Node::Index(separators, children) => {
-                    validate_index(&*self.schema, &self.collator, separators, children)?;
+                    validate_index(
+                        &*self.schema,
+                        self.ordering.range_collator(),
+                        separators,
+                        children,
+                    )?;
                     if children.len() > self.schema.order()
                         || (id != ROOT && children.len() < self.schema.order().div_ceil(2))
                     {
@@ -321,24 +338,38 @@ where
             };
 
             if lower.as_ref().is_some_and(|lower| {
-                keys.first()
-                    .is_some_and(|first| self.collator.cmp_routing(first, lower).is_lt())
+                keys.first().is_some_and(|first| {
+                    self.ordering
+                        .range_collator()
+                        .cmp_routing(first, lower)
+                        .is_lt()
+                })
             }) || upper.as_ref().is_some_and(|upper| {
-                keys.last()
-                    .is_some_and(|last| self.collator.cmp_routing(last, upper).is_gt())
+                keys.last().is_some_and(|last| {
+                    self.ordering
+                        .range_collator()
+                        .cmp_routing(last, upper)
+                        .is_gt()
+                })
             }) {
                 return Err(invalid("invalid BTree ordering or subtree boundary"));
             }
 
             match &*node {
                 Node::Leaf(rows) => {
-                    has_ties |= rows
-                        .windows(2)
-                        .any(|pair| self.collator.cmp(&pair[0], &pair[1]).is_eq())
-                        || upper.as_ref().is_some_and(|upper| {
-                            rows.last()
-                                .is_some_and(|row| self.collator.cmp_routing(row, upper).is_eq())
-                        });
+                    has_ties |= rows.windows(2).any(|pair| {
+                        self.ordering
+                            .range_collator()
+                            .cmp(&pair[0], &pair[1])
+                            .is_eq()
+                    }) || upper.as_ref().is_some_and(|upper| {
+                        rows.last().is_some_and(|row| {
+                            self.ordering
+                                .range_collator()
+                                .cmp_routing(row, upper)
+                                .is_eq()
+                        })
+                    });
 
                     if leaf_depth
                         .replace(depth)
@@ -370,6 +401,7 @@ where
         }
 
         let mut pending = vec![(ROOT, None::<Vec<S::Value>>)];
+        let mut next_first: Option<Vec<S::Value>> = None;
 
         while let Some((id, upper)) = pending.pop() {
             let node = tree
@@ -389,18 +421,28 @@ where
                     }
                 }
                 Node::Leaf(rows) => {
+                    if rows
+                        .last()
+                        .zip(next_first.as_ref())
+                        .is_some_and(|(left, right)| {
+                            self.ordering.key_collator().cmp(left, right).is_gt()
+                        })
+                    {
+                        return Err(invalid("invalid BTree tie ordering across leaves"));
+                    }
+
+                    next_first = rows.first().cloned();
                     for (i, row) in rows.iter().enumerate() {
-                        // Exact identity remains independent of collation. Checking
-                        // each tied row is quadratic in a large equivalent group,
-                        // without collecting that group or counting routing copies.
-                        let tied = rows
-                            .get(i + 1)
-                            .is_some_and(|next| self.collator.cmp(row, next).is_eq())
-                            || i.checked_sub(1)
-                                .is_some_and(|j| self.collator.cmp(row, &rows[j]).is_eq())
-                            || upper
-                                .as_ref()
-                                .is_some_and(|upper| self.collator.cmp_routing(row, upper).is_eq());
+                        // Strict physical ordering excludes duplicate identities.
+                        // Only residual physical ties need semantic lookup, which
+                        // owns ambiguity checks without collecting a tied keyset.
+                        let tied = rows.get(i + 1).is_some_and(|next| {
+                            self.ordering.key_collator().cmp(row, next).is_eq()
+                        }) || i.checked_sub(1).is_some_and(|j| {
+                            self.ordering.key_collator().cmp(row, &rows[j]).is_eq()
+                        }) || upper.as_ref().is_some_and(|upper| {
+                            self.ordering.key_collator().cmp(row, upper).is_eq()
+                        });
 
                         if tied {
                             tree.get(row).await?;
@@ -445,46 +487,56 @@ where
 
         Ok(Self {
             schema: self.schema.clone(),
-            collator: self.collator.clone(),
+            ordering: self.ordering.clone(),
             dir: target,
         })
     }
 }
 
 /// A B+Tree
-pub struct BTree<S, C, G> {
+pub struct BTree<S, C, G, O = C> {
     schema: Arc<S>,
-    collator: Collator<C>,
+    ordering: IndexOrder<C, O>,
     dir: G,
 }
 
-impl<S, C, G> Clone for BTree<S, C, G>
+impl<S, C, G, O> BTree<S, C, G, O> {
+    /// Borrow the comparison behavior of this native view.
+    pub fn ordering(&self) -> &IndexOrder<C, O> {
+        &self.ordering
+    }
+}
+
+impl<S, C, G, O> Clone for BTree<S, C, G, O>
 where
     C: Clone,
+    O: Clone,
     G: Clone,
 {
     fn clone(&self) -> Self {
         Self {
             schema: self.schema.clone(),
-            collator: self.collator.clone(),
+            ordering: self.ordering.clone(),
             dir: self.dir.clone(),
         }
     }
 }
 
-impl<S, C, G> BTree<S, C, G>
+impl<S, C, G, O> BTree<S, C, G, O>
 where
     S: Schema,
     C: Collate<Value = S::Value>,
+    O: Collate<Value = S::Value>,
 {
     /// Borrow the storage owner for a scoped read. Retained streams still own their storage.
-    pub fn as_ref(&self) -> BTree<S, C, &G>
+    pub fn as_ref(&self) -> BTree<S, C, &G, O>
     where
         C: Clone,
+        O: Clone,
     {
         BTree {
             schema: self.schema.clone(),
-            collator: self.collator.clone(),
+            ordering: self.ordering.clone(),
             dir: &self.dir,
         }
     }
@@ -495,21 +547,22 @@ where
     }
 }
 
-impl<S, C, FE> BTree<S, C, DirWriteGuardOwned<FE>> {
+impl<S, C, FE, O> BTree<S, C, DirWriteGuardOwned<FE>, O> {
     /// Downgrade this [`BTreeWriteGuard`] into a [`BTreeReadGuard`].
-    pub fn downgrade(self) -> BTreeReadGuard<S, C, FE> {
+    pub fn downgrade(self) -> BTreeReadGuard<S, C, FE, O> {
         BTreeReadGuard {
             schema: self.schema,
-            collator: self.collator,
+            ordering: self.ordering,
             dir: Arc::new(self.dir.downgrade()),
         }
     }
 }
 
-impl<S, C, FE> BTree<S, C, DirWriteGuardOwned<FE>>
+impl<S, C, FE, O> BTree<S, C, DirWriteGuardOwned<FE>, O>
 where
     S: Schema + Send + Sync,
     C: Collate<Value = S::Value> + Send + Sync,
+    O: Collate<Value = S::Value> + Send + Sync,
     FE: AsType<Node<S::Value>> + Send + Sync + FileLoad,
 {
     async fn write_node(
@@ -524,10 +577,16 @@ where
             .write_file_owned(id.hyphenated().encode_lower(&mut Uuid::encode_buffer()))
             .await
             .map_err(required_node_error)?;
+
         match &*node {
             Node::Leaf(rows) => validate_rows(rows, self.schema.len())?,
             Node::Index(separators, children) => {
-                validate_index(&*self.schema, &self.collator, separators, children)?;
+                validate_index(
+                    &*self.schema,
+                    self.ordering.range_collator(),
+                    separators,
+                    children,
+                )?;
             }
         }
 
@@ -535,7 +594,7 @@ where
     }
 }
 
-impl<S: fmt::Debug, C, G> fmt::Debug for BTree<S, C, G> {
+impl<S: fmt::Debug, C, G, O> fmt::Debug for BTree<S, C, G, O> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "B+Tree index with schema {:?}", self.schema)
     }
@@ -570,7 +629,7 @@ fn validate_rows<V>(rows: &[Vec<V>], width: usize) -> io::Result<()> {
 // requires no child reads; strict validation separately checks subtree bounds.
 fn validate_index<S, C>(
     schema: &S,
-    collator: &Collator<C>,
+    ordering: &RangeCollator<C>,
     separators: &[Vec<S::Value>],
     children: &[Uuid],
 ) -> io::Result<()>
@@ -592,7 +651,7 @@ where
 
     if separators
         .windows(2)
-        .any(|pair| collator.cmp_routing(&pair[0], &pair[1]).is_gt())
+        .any(|pair| ordering.cmp_routing(&pair[0], &pair[1]).is_gt())
     {
         return Err(freqfs::IntegrityError::invalid_data(
             "invalid BTree ordering or subtree boundary",

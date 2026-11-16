@@ -10,10 +10,11 @@ use uuid::Uuid;
 
 use super::{BTree, Node, ROOT, Schema};
 
-impl<S, C, FE> BTree<S, C, DirWriteGuardOwned<FE>>
+impl<S, C, FE, O> BTree<S, C, DirWriteGuardOwned<FE>, O>
 where
     S: Schema + Send + Sync,
     C: Collate<Value = S::Value> + Send + Sync,
+    O: Collate<Value = S::Value> + Send + Sync,
     FE: AsType<Node<S::Value>> + Send + Sync + FileLoad,
 {
     /// Delete the complete `key` from this B+Tree. Invalid widths reject before lookup.
@@ -153,7 +154,7 @@ where
                         right.insert(0, left.pop().expect("nonempty lending leaf"));
                     }
 
-                    separators[boundary] = self.collator.separator(
+                    separators[boundary] = self.ordering.range_collator().separator(
                         left.last().expect("nonempty left leaf"),
                         right.first().expect("nonempty right leaf"),
                     );
