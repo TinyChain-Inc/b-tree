@@ -9,24 +9,24 @@ use uuid::Uuid;
 
 use super::{BTree, Node, Schema, validate_index, validate_key};
 
-impl<S, C, FE> BTree<S, C, DirWriteGuardOwned<FE>>
+impl<S, C, FE, O> BTree<S, C, DirWriteGuardOwned<FE>, O>
 where
     S: Schema + Send + Sync,
     C: Collate<Value = S::Value> + Send + Sync,
+    O: Collate<Value = S::Value> + Send + Sync,
     FE: AsType<Node<S::Value>> + Send + Sync + FileLoad,
 {
-    /// Replace an exact row without changing its position or the tree topology.
+    /// Replace an exact row, relocating it when its ordered position changes.
     ///
-    /// The replacement must remain between the actual predecessor and
-    /// successor, including across leaf boundaries. It need not compare equal to
-    /// the previous row. Returns false when the previous row is absent.
+    /// Replacement stays in place when it remains between its neighbors.
+    /// Returns false when the previous row is absent.
     ///
-    /// Distinct collator-equivalent rows are allowed. Value collisions and
-    /// relocation are rejected before any row contents change.
+    /// Distinct ordering-equivalent rows are allowed. Value collisions are
+    /// rejected before any row contents change.
     ///
     /// The supplied row is published even when semantically equal to the old row.
-    /// Only routing separators crossed by the replacement are updated; no
-    /// delete/reinsert or additional caller-side ordering guard is needed.
+    /// In-place replacement updates only crossed routing separators. Relocation
+    /// uses ordinary deletion and insertion and may be interrupted between them.
     ///
     /// All validation and guard acquisition precede the synchronous publication;
     /// this does not provide durability or atomicity across multiple indexes.
@@ -111,12 +111,13 @@ where
             slot.checked_sub(1),
             slot.checked_add(1).filter(|&i| i < rows.len()),
         ]
-        .map(|next| next.map(|i| self.collator.cmp_slices(&replacement, &rows[i])));
+        .map(|next| next.map(|i| self.ordering.key_collator().cmp(&replacement, &rows[i])));
         drop(node);
 
         // Only a changed leaf extreme can cross a routing separator. At most two
         // ancestor separators need preparation, regardless of tree height.
         let mut boundaries = Vec::with_capacity(2);
+        let mut relocate = false;
         for (forward, local) in [false, true].into_iter().zip(local) {
             let order = if let Some(order) = local {
                 order
@@ -131,17 +132,15 @@ where
 
                 let neighbor_slot = neighbor_path.last().expect("neighbor path").1;
                 let neighbor_row = &rows[neighbor_slot];
-                let order = self.collator.cmp_slices(&replacement, neighbor_row);
+                let order = self.ordering.key_collator().cmp(&replacement, neighbor_row);
 
                 if if forward {
                     order.is_gt()
                 } else {
                     order.is_lt()
                 } {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "replacement must remain between its neighbors",
-                    ));
+                    relocate = true;
+                    break;
                 }
 
                 let level = path
@@ -166,12 +165,23 @@ where
                     ));
                 };
 
-                validate_index(&*self.schema, &self.collator, separators, children)?;
+                validate_index(
+                    &*self.schema,
+                    self.ordering.range_collator(),
+                    separators,
+                    children,
+                )?;
                 let separator = separators.get(boundary).ok_or_else(|| {
                     freqfs::IntegrityError::invalid_data("missing replacement separator")
                 })?;
-                let previous_order = self.collator.cmp_routing(previous, separator);
-                let neighbor_order = self.collator.cmp_routing(neighbor_row, separator);
+                let previous_order = self
+                    .ordering
+                    .range_collator()
+                    .cmp_routing(previous, separator);
+                let neighbor_order = self
+                    .ordering
+                    .range_collator()
+                    .cmp_routing(neighbor_row, separator);
 
                 if if forward {
                     previous_order.is_gt() || neighbor_order.is_lt()
@@ -183,7 +193,10 @@ where
                     ));
                 }
 
-                let crosses = self.collator.cmp_routing(&replacement, separator);
+                let crosses = self
+                    .ordering
+                    .range_collator()
+                    .cmp_routing(&replacement, separator);
 
                 if if forward {
                     crosses.is_gt()
@@ -191,9 +204,13 @@ where
                     crosses.is_lt()
                 } {
                     let updated = if forward {
-                        self.collator.separator(&replacement, neighbor_row)
+                        self.ordering
+                            .range_collator()
+                            .separator(&replacement, neighbor_row)
                     } else {
-                        self.collator.separator(neighbor_row, &replacement)
+                        self.ordering
+                            .range_collator()
+                            .separator(neighbor_row, &replacement)
                     };
                     boundaries.push((level, boundary, separator.clone(), updated));
                 }
@@ -206,11 +223,24 @@ where
             } else {
                 order.is_lt()
             } {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "replacement must remain between its neighbors",
+                relocate = true;
+                break;
+            }
+        }
+
+        if relocate {
+            if !self.delete(previous).await? {
+                return Err(freqfs::IntegrityError::invalid_data(
+                    "replacement target disappeared",
                 ));
             }
+
+            if !self.insert(replacement).await? {
+                return Err(freqfs::IntegrityError::invalid_data(
+                    "replacement insertion conflicted",
+                ));
+            }
+            return Ok(true);
         }
 
         // Acquire affected ancestors once, root-to-leaf, then the leaf. All

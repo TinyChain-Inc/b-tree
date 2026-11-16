@@ -8,24 +8,23 @@ use destream::{de, en};
 use get_size::GetSize;
 use uuid::Uuid;
 
-use super::Collator;
-use super::range::Range;
+use super::{RangeCollator, range::Range};
 
 /// An ordered set of keys in a [`Node`].
 pub trait Block<V> {
     type Key;
 
-    fn bisect<C, BV>(&self, range: &Range<BV>, collator: &Collator<C>) -> (usize, usize)
+    fn bisect<C, BV>(&self, range: &Range<BV>, collator: &RangeCollator<C>) -> (usize, usize)
     where
         C: Collate<Value = V>,
         BV: Borrow<V>;
 
-    fn bisect_left<C, BV>(&self, key: &[BV], collator: &Collator<C>) -> usize
+    fn bisect_left<C, BV>(&self, key: &[BV], collator: &RangeCollator<C>) -> usize
     where
         C: Collate<Value = V>,
         BV: Borrow<V>;
 
-    fn bisect_right<C, BV>(&self, key: &[BV], collator: &Collator<C>) -> usize
+    fn bisect_right<C, BV>(&self, key: &[BV], collator: &RangeCollator<C>) -> usize
     where
         C: Collate<Value = V>,
         BV: Borrow<V>;
@@ -34,7 +33,7 @@ pub trait Block<V> {
 impl<V: fmt::Debug> Block<V> for Vec<Vec<V>> {
     type Key = Vec<V>;
 
-    fn bisect<C, BV>(&self, range: &Range<BV>, collator: &Collator<C>) -> (usize, usize)
+    fn bisect<C, BV>(&self, range: &Range<BV>, collator: &RangeCollator<C>) -> (usize, usize)
     where
         C: Collate<Value = V>,
         BV: Borrow<V>,
@@ -91,7 +90,7 @@ impl<V: fmt::Debug> Block<V> for Vec<Vec<V>> {
         (left, right)
     }
 
-    fn bisect_left<C, BV>(&self, key: &[BV], collator: &Collator<C>) -> usize
+    fn bisect_left<C, BV>(&self, key: &[BV], collator: &RangeCollator<C>) -> usize
     where
         C: Collate<Value = V>,
         BV: Borrow<V>,
@@ -110,7 +109,7 @@ impl<V: fmt::Debug> Block<V> for Vec<Vec<V>> {
         lo
     }
 
-    fn bisect_right<C, BV>(&self, key: &[BV], collator: &Collator<C>) -> usize
+    fn bisect_right<C, BV>(&self, key: &[BV], collator: &RangeCollator<C>) -> usize
     where
         C: Collate<Value = V>,
         BV: Borrow<V>,

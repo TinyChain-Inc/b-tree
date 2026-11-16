@@ -31,7 +31,12 @@ async fn functional_test() -> Result<(), io::Error> {
         let dir = cache.load(path.clone())?;
 
         // create a new B+ tree
-        let btree = BTreeLock::create(schema, Collator::<i16>::default(), dir).await?;
+        let btree = BTreeLock::create(
+            schema,
+            b_tree::IndexOrder::new(Collator::<i16>::default()),
+            dir,
+        )
+        .await?;
 
         let default_range = Range::<i16>::default();
 
@@ -213,7 +218,12 @@ async fn load_test() -> Result<(), io::Error> {
         let dir = cache.load(path.clone())?;
 
         // create a new B+ tree
-        let btree = BTreeLock::create(schema, Collator::<i16>::default(), dir).await?;
+        let btree = BTreeLock::create(
+            schema,
+            b_tree::IndexOrder::new(Collator::<i16>::default()),
+            dir,
+        )
+        .await?;
 
         {
             let mut view = btree.write().await;

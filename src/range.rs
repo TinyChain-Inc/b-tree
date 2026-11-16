@@ -6,7 +6,7 @@ use std::{fmt, io};
 use collate::{Collate, Overlap, OverlapsRange, OverlapsValue};
 use smallvec::smallvec;
 
-use super::{Collator, Key};
+use super::{Key, RangeCollator};
 
 /// A range used to select a slice of a `BTree`
 #[derive(Clone, Eq, PartialEq)]
@@ -100,7 +100,7 @@ impl<V> Range<V> {
 }
 
 impl<V> Range<V> {
-    pub(super) fn validate<C>(&self, columns: usize, collator: &Collator<C>) -> io::Result<()>
+    pub(super) fn validate<C>(&self, columns: usize, collator: &RangeCollator<C>) -> io::Result<()>
     where
         V: Borrow<C::Value>,
         C: Collate,
@@ -134,7 +134,7 @@ impl<V> Range<V> {
         &self,
         separator: &[C::Value],
         lower: bool,
-        collator: &Collator<C>,
+        collator: &RangeCollator<C>,
     ) -> Ordering
     where
         V: Borrow<C::Value>,
@@ -185,7 +185,7 @@ impl<V> Range<V> {
     pub(crate) fn child_slots<C>(
         &self,
         separators: &[Vec<C::Value>],
-        collator: &Collator<C>,
+        collator: &RangeCollator<C>,
     ) -> (usize, usize)
     where
         V: Borrow<C::Value>,
@@ -200,7 +200,7 @@ impl<V> Range<V> {
 }
 
 impl<BV> Range<BV> {
-    fn overlaps_key<C>(&self, key: &[C::Value], collator: &Collator<C>) -> Overlap
+    fn overlaps_key<C>(&self, key: &[C::Value], collator: &RangeCollator<C>) -> Overlap
     where
         BV: Borrow<C::Value>,
         C: Collate,
@@ -245,19 +245,19 @@ impl<BV> Range<BV> {
     }
 }
 
-impl<BV, C> OverlapsValue<Vec<C::Value>, Collator<C>> for Range<BV>
+impl<BV, C> OverlapsValue<Vec<C::Value>, RangeCollator<C>> for Range<BV>
 where
     BV: Borrow<C::Value>,
     C: Collate,
     C::Value: fmt::Debug,
 {
-    fn overlaps_value(&self, key: &Vec<C::Value>, collator: &Collator<C>) -> Overlap {
+    fn overlaps_value(&self, key: &Vec<C::Value>, collator: &RangeCollator<C>) -> Overlap {
         self.overlaps_key(key, collator)
     }
 }
 
-impl<C: Collate> OverlapsRange<Range<C::Value>, Collator<C>> for Range<C::Value> {
-    fn overlaps(&self, other: &Range<C::Value>, collator: &Collator<C>) -> Overlap {
+impl<C: Collate> OverlapsRange<Range<C::Value>, RangeCollator<C>> for Range<C::Value> {
+    fn overlaps(&self, other: &Range<C::Value>, collator: &RangeCollator<C>) -> Overlap {
         match collator.cmp_slices(&self.prefix, &other.prefix) {
             Ordering::Less => Overlap::Less,
             Ordering::Greater => Overlap::Greater,

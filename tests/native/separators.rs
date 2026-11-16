@@ -11,7 +11,12 @@ async fn in_place_splits_merges_copy_and_reopening() -> Result<(), io::Error> {
             schema.order = order;
             let cache = Cache::<File>::new(1024 * 1024, None, 0, std::time::Duration::from_secs(3));
             let dir = cache.clone().load(path.clone())?;
-            let tree = BTreeLock::create(schema, Collator::default(), dir.clone()).await?;
+            let tree = BTreeLock::create(
+                schema,
+                b_tree::IndexOrder::new(Collator::default()),
+                dir.clone(),
+            )
+            .await?;
             for key in 0..100 {
                 tree.write().await.insert(vec![key]).await?;
             }
@@ -34,7 +39,11 @@ async fn in_place_splits_merges_copy_and_reopening() -> Result<(), io::Error> {
                     .load(path.clone())?;
             let mut schema = ExampleSchema::<i16>::new(1);
             schema.order = order;
-            let tree = BTreeLock::load(schema, Collator::default(), reopened.clone())?;
+            let tree = BTreeLock::load(
+                schema,
+                b_tree::IndexOrder::new(Collator::default()),
+                reopened.clone(),
+            )?;
             tree.validate().await?;
             let keys: Vec<_> = tree
                 .read()
@@ -133,7 +142,7 @@ async fn compact_separators_preserve_complete_rows_and_boundaries() -> io::Resul
             .load(path.clone())?;
         let tree = BTreeLock::create(
             ExampleSchema::<i16>::new(3),
-            Collator::default(),
+            b_tree::IndexOrder::new(Collator::default()),
             dir.clone(),
         )
         .await?;
@@ -322,7 +331,11 @@ async fn compact_separators_preserve_complete_rows_and_boundaries() -> io::Resul
         drop(dir);
         let dir = Cache::<File>::new(1024 * 1024, None, 0, std::time::Duration::from_secs(1))
             .load(path.clone())?;
-        let reopened = BTreeLock::load(ExampleSchema::<i16>::new(3), Collator::default(), dir)?;
+        let reopened = BTreeLock::load(
+            ExampleSchema::<i16>::new(3),
+            b_tree::IndexOrder::new(Collator::default()),
+            dir,
+        )?;
         reopened.validate().await?;
         let actual: Vec<Vec<i16>> = reopened
             .read()
@@ -348,7 +361,7 @@ async fn lookup_between_separators_preserves_range_results() -> Result<(), io::E
         let cache = Cache::<File>::new(1024 * 1024, None, 0, std::time::Duration::from_secs(3));
         let tree = BTreeLock::create(
             ExampleSchema::<i16>::new(1),
-            Collator::<i16>::default(),
+            b_tree::IndexOrder::new(Collator::<i16>::default()),
             cache.load(path.clone())?,
         )
         .await?;
@@ -382,7 +395,7 @@ async fn load_requires_existing_root() -> Result<(), io::Error> {
         assert!(
             BTreeLock::load(
                 ExampleSchema::<i16>::new(1),
-                Collator::<i16>::default(),
+                b_tree::IndexOrder::new(Collator::<i16>::default()),
                 dir.clone()
             )
             .is_err()
@@ -392,7 +405,7 @@ async fn load_requires_existing_root() -> Result<(), io::Error> {
             let mut schema = ExampleSchema::<i16>::new(1);
             schema.order = order;
             assert!(matches!(
-                BTreeLock::create(schema, Collator::<i16>::default(), dir.clone()).await,
+                BTreeLock::create(schema, b_tree::IndexOrder::new(Collator::<i16>::default()), dir.clone()).await,
                 Err(error) if error.kind() == io::ErrorKind::InvalidInput
             ));
             assert!(
@@ -403,7 +416,7 @@ async fn load_requires_existing_root() -> Result<(), io::Error> {
 
         let tree = BTreeLock::create(
             ExampleSchema::<i16>::new(1),
-            Collator::<i16>::default(),
+            b_tree::IndexOrder::new(Collator::<i16>::default()),
             dir.clone(),
         )
         .await?;
@@ -412,14 +425,14 @@ async fn load_requires_existing_root() -> Result<(), io::Error> {
             let mut schema = ExampleSchema::<i16>::new(1);
             schema.order = order;
             assert!(matches!(
-                BTreeLock::load(schema, Collator::<i16>::default(), dir.clone()),
+                BTreeLock::load(schema, b_tree::IndexOrder::new(Collator::<i16>::default()), dir.clone()),
                 Err(error) if error.kind() == io::ErrorKind::InvalidInput
             ));
         }
         assert!(
             BTreeLock::load(
                 ExampleSchema::<i16>::new(1),
-                Collator::<i16>::default(),
+                b_tree::IndexOrder::new(Collator::<i16>::default()),
                 dir.clone()
             )
             .is_ok()
@@ -427,7 +440,7 @@ async fn load_requires_existing_root() -> Result<(), io::Error> {
         assert!(
             BTreeLock::create(
                 ExampleSchema::<i16>::new(1),
-                Collator::<i16>::default(),
+                b_tree::IndexOrder::new(Collator::<i16>::default()),
                 dir
             )
             .await
@@ -455,7 +468,7 @@ async fn deletion_validates_siblings_before_rebalancing() -> io::Result<()> {
                         .load(fixture.path().to_owned())?;
                         let tree = BTreeLock::create(
                             ExampleSchema::<i16>::new(1),
-                            Collator::default(),
+                            b_tree::IndexOrder::new(Collator::default()),
                             dir.clone(),
                         )
                         .await?;

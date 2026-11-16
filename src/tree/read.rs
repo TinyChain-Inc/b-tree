@@ -2,6 +2,7 @@
 
 use std::{
     borrow::Borrow,
+    cmp::Ordering,
     fmt, io,
     ops::{ControlFlow, Deref},
     pin::Pin,
@@ -9,26 +10,28 @@ use std::{
 
 use collate::{Collate, OverlapsValue};
 use freqfs::{DirDeref, FileLoad, FileReadGuard};
-use futures::future::{self, Future, FutureExt};
-use futures::stream::{self, Stream, StreamExt, TryStreamExt};
+use futures::{
+    future::{self, Future, FutureExt},
+    stream::{self, Stream, StreamExt, TryStreamExt},
+};
 use safecast::AsType;
 use smallvec::SmallVec;
 use uuid::Uuid;
 
-use super::{BTree, Collator, Key, Leaf, Node, ROOT, Schema, validate_index, validate_rows};
-use crate::NODE_STACK_SIZE;
-use crate::node::Block;
-use crate::range::Range;
+use super::{BTree, Key, Leaf, Node, ROOT, RangeCollator, Schema, validate_index, validate_rows};
+use crate::{NODE_STACK_SIZE, node::Block, range::Range};
 
 type ScopedKeys<'a, V> = Pin<Box<dyn Stream<Item = Result<Key<V>, io::Error>> + Send + 'a>>;
 
 type Nodes<'a, FE, V> = Pin<Box<dyn Stream<Item = Result<Leaf<FE, V>, io::Error>> + Send + 'a>>;
+
 type ResultNodes<'a, FE, V> = Result<Nodes<'a, FE, V>, io::Error>;
 
-impl<S, C, FE, G> BTree<S, C, G>
+impl<S, C, FE, G, O> BTree<S, C, G, O>
 where
     S: Schema,
     C: Collate<Value = S::Value>,
+    O: Collate<Value = S::Value>,
     FE: AsType<Node<S::Value>> + Send + Sync + FileLoad,
     G: DirDeref<Entry = FE>,
     Node<S::Value>: fmt::Debug,
@@ -64,7 +67,7 @@ where
     /// use freqfs::{DirDeref, FileLoad};
     /// use safecast::AsType;
     ///
-    /// async fn escape<S, C, FE, G>(tree: &BTree<S, C, G>, key: &[S::Value])
+    /// async fn escape<S, C, FE, G>(tree: &BTree<S, C, G, O>, key: &[S::Value])
     /// where
     ///     S: Schema,
     ///     C: Collate<Value = S::Value>,
@@ -95,9 +98,11 @@ where
             .read_file(id.hyphenated().encode_lower(&mut Uuid::encode_buffer()))
             .await
             .map_err(super::required_node_error)?;
+
         let Node::Leaf(rows) = &*node else {
             return Err(freqfs::IntegrityError::invalid_data("expected leaf").into());
         };
+
         validate_rows(rows, self.schema.len())?;
         let row = rows
             .get(slot)
@@ -117,20 +122,31 @@ where
         mut select: impl FnMut(&[(Uuid, usize)], &[S::Value]) -> R,
     ) -> Result<Option<R>, io::Error> {
         let mut found = None;
-        self.visit_equivalent(prefix, |path, row| {
-            if row.starts_with(prefix) {
-                if found.is_some() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "ambiguous semantic key",
-                    ));
+        let complete = prefix.len() == self.schema.len();
+        self.visit_ordered(
+            prefix,
+            move |row, key| {
+                if complete {
+                    self.ordering.key_collator().cmp(row, key)
+                } else {
+                    self.ordering.range_collator().cmp_slices(row, key)
+                }
+            },
+            |path, row| {
+                if row.starts_with(prefix) {
+                    if found.is_some() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "ambiguous semantic key",
+                        ));
+                    }
+
+                    found = Some(select(path, row));
                 }
 
-                found = Some(select(path, row));
-            }
-
-            Ok(false)
-        })
+                Ok(false)
+            },
+        )
         .await?;
 
         Ok(found)
@@ -142,11 +158,16 @@ where
     ) -> Result<(Vec<(Uuid, usize)>, bool), io::Error> {
         let mut found = false;
         let path = self
-            .visit_equivalent(key, |_, row| {
-                found = row.len() >= key.len() && row.iter().zip(key).all(|(a, b)| a == b.borrow());
+            .visit_ordered(
+                key,
+                |row, key| self.ordering.key_collator().cmp(row, key),
+                |_, row| {
+                    found =
+                        row.len() >= key.len() && row.iter().zip(key).all(|(a, b)| a == b.borrow());
 
-                Ok(found)
-            })
+                    Ok(found)
+                },
+            )
             .await?;
 
         Ok((path, found))
@@ -157,6 +178,23 @@ where
     pub(super) async fn visit_equivalent<V: Borrow<S::Value>>(
         &self,
         key: &[V],
+        visit: impl FnMut(&[(Uuid, usize)], &[S::Value]) -> Result<bool, io::Error>,
+    ) -> Result<Vec<(Uuid, usize)>, io::Error> {
+        self.visit_ordered(
+            key,
+            |row, key| self.ordering.range_collator().cmp_slices(row, key),
+            visit,
+        )
+        .await
+    }
+
+    // Ordinary groups support semantic prefixes and replacement. Complete-key
+    // identity search can narrow them by physical order, including across leaves.
+    // Residual ties still require equality checks; refinement need not be total.
+    async fn visit_ordered<V: Borrow<S::Value>>(
+        &self,
+        key: &[V],
+        compare: impl Fn(&[S::Value], &[V]) -> Ordering,
         mut visit: impl FnMut(&[(Uuid, usize)], &[S::Value]) -> Result<bool, io::Error>,
     ) -> Result<Vec<(Uuid, usize)>, io::Error> {
         let mut path = Vec::new();
@@ -177,16 +215,24 @@ where
 
             match &*node {
                 Node::Index(separators, children) => {
-                    validate_index(&*self.schema, &self.collator, separators, children)?;
+                    validate_index(
+                        &*self.schema,
+                        self.ordering.range_collator(),
+                        separators,
+                        children,
+                    )?;
                     let slot = separators.partition_point(|separator| {
-                        self.collator.cmp_routing(separator, key).is_lt()
+                        compare(separator, key)
+                            .then_with(|| separator.len().cmp(&key.len()))
+                            .is_lt()
                     });
+
                     path.push((id, slot));
                     id = children[slot];
                 }
                 Node::Leaf(rows) => {
                     validate_rows(rows, self.schema.len())?;
-                    path.push((id, rows.bisect_left(key, &self.collator)));
+                    path.push((id, rows.partition_point(|row| compare(row, key).is_lt())));
                     break node;
                 }
             }
@@ -200,7 +246,7 @@ where
 
             for (slot, row) in rows.iter().enumerate().skip(start) {
                 path.last_mut().expect("leaf path").1 = slot;
-                if !self.collator.cmp_slices(row, key).is_eq() || visit(&path, row)? {
+                if !compare(row, key).is_eq() || visit(&path, row)? {
                     return Ok(path);
                 }
             }
@@ -211,9 +257,7 @@ where
             // Do not move an absent key into a subtree beyond its routing
             // interval. Equal separators remain candidates for semantic identity.
             match self
-                .adjacent_leaf_until(&mut path, true, |separator| {
-                    self.collator.cmp_slices(separator, key).is_gt()
-                })
+                .adjacent_leaf_until(&mut path, true, |separator| compare(separator, key).is_gt())
                 .await?
             {
                 Some(next) => node = next,
@@ -246,13 +290,19 @@ where
                 .read_file(id.hyphenated().encode_lower(&mut Uuid::encode_buffer()))
                 .await
                 .map_err(super::required_node_error)?;
+
             let Node::Index(rows, children) = &*node else {
                 return Err(freqfs::IntegrityError::invalid_data(
                     "expected index ancestor",
                 ));
             };
 
-            validate_index(&*self.schema, &self.collator, rows, children)?;
+            validate_index(
+                &*self.schema,
+                self.ordering.range_collator(),
+                rows,
+                children,
+            )?;
             if slot >= children.len() {
                 return Err(freqfs::IntegrityError::invalid_data("invalid child slot"));
             }
@@ -262,6 +312,7 @@ where
             } else {
                 slot.checked_sub(1)
             };
+
             let Some(next) = next else { continue };
             let separator = &rows[if forward { slot } else { next }];
             if stop(separator) {
@@ -300,7 +351,12 @@ where
                         return Ok(Some(node));
                     }
                     Node::Index(rows, children) => {
-                        validate_index(&*self.schema, &self.collator, rows, children)?;
+                        validate_index(
+                            &*self.schema,
+                            self.ordering.range_collator(),
+                            rows,
+                            children,
+                        )?;
                         let slot = if forward { 0 } else { children.len() - 1 };
                         path.push((child, slot));
                         child = children[slot];
@@ -317,13 +373,14 @@ where
     where
         BV: Borrow<S::Value>,
     {
-        range.validate(self.schema.len(), &self.collator)?;
+        range.validate(self.schema.len(), self.ordering.range_collator())?;
         let root = self
             .dir
             .as_dir()
             .read_file(ROOT.hyphenated().encode_lower(&mut Uuid::encode_buffer()))
             .await
             .map_err(super::required_node_error)?;
+
         self.count_inner(range, root, vec![ROOT]).await
     }
 
@@ -344,12 +401,12 @@ where
                         return Ok(keys.len() as u64);
                     }
 
-                    let (l, r) = keys.bisect(range, &self.collator);
+                    let (l, r) = keys.bisect(range, self.ordering.range_collator());
 
                     if l == keys.len() {
                         Ok(0)
                     } else if l == r {
-                        if range.contains_value(&keys[l], &self.collator) {
+                        if range.contains_value(&keys[l], self.ordering.range_collator()) {
                             Ok(1)
                         } else {
                             Ok(0)
@@ -359,8 +416,14 @@ where
                     }
                 }
                 Node::Index(separators, children) => {
-                    validate_index(&*self.schema, &self.collator, separators, children)?;
-                    let (start, end) = range.child_slots(separators, &self.collator);
+                    validate_index(
+                        &*self.schema,
+                        self.ordering.range_collator(),
+                        separators,
+                        children,
+                    )?;
+                    let (start, end) =
+                        range.child_slots(separators, self.ordering.range_collator());
                     if start >= end {
                         return Ok(0);
                     }
@@ -387,6 +450,7 @@ where
                                     )
                                     .await
                                     .map_err(super::required_node_error)?;
+
                                 Ok(self.count_inner(range, node, ancestors))
                             }
                         })
@@ -407,7 +471,7 @@ where
     where
         BV: Borrow<S::Value>,
     {
-        range.validate(self.schema.len(), &self.collator)?;
+        range.validate(self.schema.len(), self.ordering.range_collator())?;
         self.edge(&range, false, |row| stack_key(row)).await
     }
 
@@ -416,7 +480,7 @@ where
     where
         BV: Borrow<S::Value>,
     {
-        range.validate(self.schema.len(), &self.collator)?;
+        range.validate(self.schema.len(), self.ordering.range_collator())?;
         self.edge(&range, true, |row| stack_key(row)).await
     }
 
@@ -444,10 +508,17 @@ where
                 .read_file(id.hyphenated().encode_lower(&mut Uuid::encode_buffer()))
                 .await
                 .map_err(super::required_node_error)?;
+
             match &*node {
                 Node::Index(separators, children) => {
-                    validate_index(&*self.schema, &self.collator, separators, children)?;
-                    let (start, end) = range.child_slots(separators, &self.collator);
+                    validate_index(
+                        &*self.schema,
+                        self.ordering.range_collator(),
+                        separators,
+                        children,
+                    )?;
+                    let (start, end) =
+                        range.child_slots(separators, self.ordering.range_collator());
                     if start >= end {
                         return Ok(None);
                     }
@@ -468,7 +539,8 @@ where
             let Node::Leaf(rows) = &*node else {
                 return Err(freqfs::IntegrityError::invalid_data("expected leaf"));
             };
-            let (start, end) = rows.bisect(range, &self.collator);
+
+            let (start, end) = rows.bisect(range, self.ordering.range_collator());
             if start < end {
                 let row = &rows[if reverse { end - 1 } else { start }];
                 return Ok(Some(read(row)));
@@ -477,7 +549,8 @@ where
 
             match self
                 .adjacent_leaf_until(&mut path, !reverse, |separator| {
-                    let order = range.cmp_endpoint(separator, reverse, &self.collator);
+                    let order =
+                        range.cmp_endpoint(separator, reverse, self.ordering.range_collator());
                     if reverse {
                         order.is_lt()
                     } else {
@@ -495,17 +568,18 @@ where
     /// Return `true` if the given `range` of this B+Tree contains zero keys.
     pub async fn is_empty<R: Borrow<Range<S::Value>>>(&self, range: R) -> Result<bool, io::Error> {
         let range = range.borrow().as_ref();
-        range.validate(self.schema.len(), &self.collator)?;
+        range.validate(self.schema.len(), self.ordering.range_collator())?;
         self.edge(&range, false, |_| ())
             .await
             .map(|row| row.is_none())
     }
 }
 
-impl<S, C, FE, G> BTree<S, C, G>
+impl<S, C, FE, G, O> BTree<S, C, G, O>
 where
     S: Schema + Send + Sync,
     C: Collate<Value = S::Value> + Clone + Send + Sync + 'static,
+    O: Collate<Value = S::Value> + Clone + Send + Sync + 'static,
     FE: AsType<Node<S::Value>> + Send + Sync + 'static + FileLoad,
     G: DirDeref<Entry = FE> + Clone + Send + Sync,
     Node<S::Value>: fmt::Debug,
@@ -526,10 +600,10 @@ where
         BV: Borrow<S::Value> + Clone + Send + Sync,
         E: From<io::Error>,
     {
-        range.validate(self.schema.len(), &self.collator)?;
+        range.validate(self.schema.len(), self.ordering.range_collator())?;
         let mut nodes = nodes(
             &self.dir,
-            self.collator.clone(),
+            self.ordering.range_collator().clone(),
             range,
             ROOT,
             reverse,
@@ -546,6 +620,7 @@ where
                 } else {
                     offset
                 };
+
                 let row = &rows[index];
                 if visit(row)?.is_break() {
                     return Ok(());
@@ -605,7 +680,7 @@ where
         G: 'a,
         S: 'a,
     {
-        range.validate(self.schema.len(), &self.collator)?;
+        range.validate(self.schema.len(), self.ordering.range_collator())?;
         if columns
             .as_ref()
             .is_some_and(|columns| columns.iter().any(|&column| column >= self.schema.len()))
@@ -618,7 +693,7 @@ where
 
         let nodes = nodes(
             self.dir,
-            self.collator,
+            self.ordering.range,
             range,
             ROOT,
             reverse,
@@ -626,6 +701,7 @@ where
             self.schema,
         )
         .await?;
+
         let keys = nodes
             .map(move |leaf| {
                 let leaf = leaf?;
@@ -639,12 +715,14 @@ where
                     } else {
                         offset
                     };
+
                     let row = &leaf.as_ref()[index];
                     let key = if let Some(columns) = &columns {
                         columns.iter().map(|&column| row[column].clone()).collect()
                     } else {
                         row.iter().cloned().collect()
                     };
+
                     keys.push(key);
                 }
 
@@ -678,7 +756,7 @@ impl fmt::Debug for NodeRead {
 
 fn nodes<'a, S, C, BV, FE, G, H>(
     dir: G,
-    collator: Collator<C>,
+    ordering: RangeCollator<C>,
     range: Range<BV>,
     node_id: Uuid,
     reverse: bool,
@@ -726,12 +804,12 @@ where
                 if range.is_empty() {
                     NodeRead::Leaf((0, keys.len()))
                 } else {
-                    let (l, r) = keys.bisect(&range, &collator);
+                    let (l, r) = keys.bisect(&range, &ordering);
 
                     if r == 0 || l == keys.len() {
                         NodeRead::Excluded
                     } else if l == r {
-                        if range.contains_value(&keys[l], &collator) {
+                        if range.contains_value(&keys[l], &ordering) {
                             NodeRead::Leaf((l, l + 1))
                         } else {
                             NodeRead::Excluded
@@ -742,8 +820,8 @@ where
                 }
             }
             Node::Index(separators, children) => {
-                validate_index(&*schema, &collator, separators, children)?;
-                let (start, end) = range.child_slots(separators, &collator);
+                validate_index(&*schema, &ordering, separators, children)?;
+                let (start, end) = range.child_slots(separators, &ordering);
                 if start >= end {
                     NodeRead::Excluded
                 } else if end - start == 1 {
@@ -764,7 +842,7 @@ where
             }
             NodeRead::Child(node_id) => {
                 let nodes = stream::once(nodes(
-                    dir, collator, range, node_id, reverse, ancestors, schema,
+                    dir, ordering, range, node_id, reverse, ancestors, schema,
                 ))
                 .try_flatten();
 
@@ -777,7 +855,7 @@ where
                         let slot = if reverse { len - i - 1 } else { i };
                         nodes(
                             dir.clone(),
-                            collator.clone(),
+                            ordering.clone(),
                             range.clone(),
                             children[slot],
                             reverse,

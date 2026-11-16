@@ -37,10 +37,32 @@ collation-equivalent rows require a full-width separator. An omitted suffix mean
 negative infinity only for routing, not for public prefix queries: `[7]` matches
 the prefix of `[7, 42]`, but sorts before it during routing.
 
-Callers supply value comparison; `Collator` supplies key-prefix comparison,
+Callers supply value comparison; `RangeCollator` supplies key-prefix comparison,
 separator construction, and routing. Collation equality can group distinct
 values, so exact-row matching checks semantic identity separately. `Range` owns
 inclusive/exclusive endpoint comparison.
+
+`IndexOrder::new(range_values)` configures range collation and complete-key
+ordering using one ordinary `Collate` implementation. The consuming builder
+`.with_storage_order(storage_values)` optionally refines complete-key ties: it
+compares every range column and key length before applying the storage comparator.
+Both value comparators must preserve semantic equality; storage comparison may
+leave residual ties. The default type parameter is `IndexOrder<C, C>`; construction
+moves the range comparator and stores no refinement without the builder.
+
+The immutable configuration does not implement `Collate`. Select
+`.range_collator()` for ranges, prefixes, routing, and range reservations, or
+`.key_collator()` for complete stored keys. The latter borrows the configuration;
+its `cmp` accepts borrowed slices and `cmp_iter` accepts replayable borrowed
+column iterators without allocating projected rows or cloning values. These
+views implement ordinary `Collate` and `CollateRef`. Storage refinement cannot
+reorder range groups or override a later range column.
+
+Insertion, replacement, and strict validation share the complete-key order,
+including across leaves. `BTreeLock::{create, load}` and the stream-decoding
+context receive an `IndexOrder`; `ordering()` borrows the retained configuration.
+Callers which change the storage order must recreate noncanonical storage;
+loading does not sort or migrate it.
 
 Schemas validate supplied separator columns through `validate_prefix`; adapters
 own their serialization. The former internal-node structure with one copied
@@ -79,9 +101,10 @@ Ordered insertion checks duplicates across the equivalent group when the next
 input ties the previous collation.
 
 [`BTreeWriteGuard::replace`](https://docs.rs/b-tree/latest/b_tree/struct.BTree.html#method.replace)
-changes one row in place while preserving its position and the tree topology.
-Its API documentation defines collision checks and the publication boundary;
-callers remain responsible for durability and cross-index recovery.
+changes an exact row in place when its ordered position is preserved, and otherwise
+relocates it through native deletion and insertion. Collision checks precede
+mutation; interrupted relocation can leave partial changes. Callers remain
+responsible for durability and cross-index recovery.
 
 The private `tree` modules separate reads/traversal, insertion, deletion,
 replacement, and stream decoding. The module root owns public handles and shared
@@ -102,9 +125,12 @@ include their fixed column value. Included and excluded endpoints use the same
 comparison for keys and descendant ranges; equal-length prefixes compare bounds.
 
 Equivalent-group navigation reuses acquired leaf guards and retains only a
-root-to-leaf path. Lookup is linear in the size of a collation-equivalent group;
-strict validation's exact duplicate checks can require quadratic equality work
-within that group. Replacement combines identity and collision checks when both
+root-to-leaf path. Complete-key lookups use physical tie ordering to narrow the
+search, then check semantic equality within residual ties. Prefix lookups and
+replacement retain ordinary equivalent-group traversal. Strict validation checks
+physical ordering and delegates duplicate detection only for residual physical
+ties; a collator without sufficient refinement can still require quadratic
+equality work within those groups. Replacement combines identity and collision checks when both
 values belong to the same group, and releases read guards before publication.
 
 The executable example shares its schema and file adapters from `examples/support/`.

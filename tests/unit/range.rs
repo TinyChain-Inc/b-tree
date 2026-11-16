@@ -4,13 +4,13 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 use smallvec::smallvec;
 
 use super::Range;
-use crate::Collator;
+use crate::{IndexOrder, RangeCollator};
 
 #[test]
 fn hierarchical_range_overlap_uses_value_boundaries() {
     use collate::{Overlap, OverlapsRange, OverlapsValue};
 
-    let collator = Collator::new(collate::Collator::<i16>::default());
+    let collator = RangeCollator::new(collate::Collator::<i16>::default());
     for (name, parent, child, forward, reverse) in [
         (
             "all rows",
@@ -113,7 +113,7 @@ fn hierarchical_range_overlap_uses_value_boundaries() {
 
 #[test]
 fn compact_separators_route_virtual_range_endpoints() {
-    let collator = Collator::new(collate::Collator::<i16>::default());
+    let collator = RangeCollator::new(collate::Collator::<i16>::default());
     let separators = vec![vec![1], vec![2, 3], vec![2, 3], vec![2, 8], vec![4]];
     let cases = [
         ("all", Range::default(), (0, 6)),
@@ -167,7 +167,7 @@ fn compact_separators_route_virtual_range_endpoints() {
 
 #[test]
 fn compact_separator_suffix_is_not_a_prefix_wildcard() {
-    let collator = Collator::new(collate::Collator::<i16>::default());
+    let collator = RangeCollator::new(collate::Collator::<i16>::default());
     assert_eq!(
         collate::CollateRef::cmp_ref(&collator, &[7][..], &[7, 42][..]),
         Ordering::Equal
@@ -240,7 +240,7 @@ fn separator_clones_only_retained_columns() {
 
     let keys = Rc::new(Cell::new(0));
     let payloads = Rc::new(Cell::new(0));
-    let collator = Collator::new(Numeric);
+    let collator = RangeCollator::new(Numeric);
     let left = [Observed(1, keys.clone()), Observed(10, payloads.clone())];
     let right = [Observed(2, keys.clone()), Observed(20, payloads.clone())];
     assert_eq!(collator.separator(&left, &right).len(), 1);
@@ -249,4 +249,83 @@ fn separator_clones_only_retained_columns() {
     let tied = [Observed(2, keys.clone()), Observed(20, payloads.clone())];
     assert_eq!(collator.separator(&right, &tied).len(), 2);
     assert_eq!((keys.get(), payloads.get()), (2, 1));
+}
+
+#[test]
+fn complete_key_composition_borrows_values_and_defers_secondary_order() {
+    use std::cell::Cell;
+
+    use collate::Collate;
+
+    struct Item(i32);
+
+    #[derive(Eq, PartialEq)]
+    struct Tens;
+
+    impl Collate for Tens {
+        type Value = Item;
+
+        fn cmp(&self, left: &Item, right: &Item) -> Ordering {
+            (left.0 / 10).cmp(&(right.0 / 10))
+        }
+    }
+
+    #[derive(Eq, PartialEq)]
+    struct Exact<'a>(&'a Cell<usize>);
+
+    impl Collate for Exact<'_> {
+        type Value = Item;
+
+        fn cmp(&self, left: &Item, right: &Item) -> Ordering {
+            self.0.set(self.0.get() + 1);
+            left.0.cmp(&right.0)
+        }
+    }
+
+    let calls = Cell::new(0);
+    let order = IndexOrder::new(Tens).with_storage_order(Exact(&calls));
+    let left = [Item(1), Item(20)];
+    let right = [Item(9), Item(10)];
+    let tied = [Item(9), Item(20)];
+
+    assert_eq!(order.key_collator().cmp(&left, &right), Ordering::Greater);
+    assert_eq!(
+        order.key_collator().cmp(&left, &tied[..1]),
+        Ordering::Greater
+    );
+    assert_eq!(calls.get(), 0);
+    assert_eq!(order.key_collator().cmp(&left, &tied), Ordering::Less);
+    assert_eq!(calls.get(), 1);
+    assert_eq!(
+        order.key_collator().cmp_iter(left.iter(), tied.iter()),
+        Ordering::Less
+    );
+    assert_eq!(
+        IndexOrder::new(Tens).key_collator().cmp(&left, &tied),
+        Ordering::Equal
+    );
+
+    // A refinement opposing range order cannot move a row out of its group.
+    #[derive(Eq, PartialEq)]
+    struct ReverseTens;
+
+    impl Collate for ReverseTens {
+        type Value = Item;
+
+        fn cmp(&self, left: &Item, right: &Item) -> Ordering {
+            Tens.cmp(right, left)
+        }
+    }
+
+    let opposing = IndexOrder::new(Tens).with_storage_order(ReverseTens);
+    assert_eq!(
+        opposing.key_collator().cmp(&left, &right),
+        Ordering::Greater
+    );
+
+    // The default needs neither a cloneable comparator nor a second pass.
+    calls.set(0);
+    let unrefined = IndexOrder::new(Exact(&calls));
+    assert_eq!(unrefined.key_collator().cmp(&left, &left), Ordering::Equal);
+    assert_eq!(calls.get(), left.len());
 }
