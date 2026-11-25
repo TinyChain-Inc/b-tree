@@ -18,7 +18,6 @@ mod adapters;
 mod directory;
 #[path = "common/observations.rs"]
 mod observations;
-
 #[path = "native/construction.rs"]
 mod construction;
 #[path = "native/lifecycle.rs"]

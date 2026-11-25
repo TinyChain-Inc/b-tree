@@ -8,7 +8,7 @@ async fn ordinary_reads_reject_malformed_leaf_rows() -> io::Result<()> {
             .load(fixture.path().to_owned())?;
         let tree = BTreeLock::create(
             ExampleSchema::<i16>::new(2),
-            b_tree::IndexOrder::new(Collator::default()),
+            Collator::default(),
             dir.clone(),
         )
         .await?;
@@ -117,7 +117,7 @@ async fn ordinary_reads_reject_malformed_leaf_rows() -> io::Result<()> {
                     .load(path.path().to_owned())?;
             let tree = BTreeLock::create(
                 ExampleSchema::<i16>::new(2),
-                b_tree::IndexOrder::new(Collator::default()),
+                Collator::default(),
                 dir.clone(),
             )
             .await?;
@@ -172,12 +172,8 @@ async fn root_creation_reclaims_cached_nodes() -> io::Result<()> {
         let root = cache.load(path.clone())?;
         for name in ["first", "second", "third"] {
             let dir = root.write().await.create_dir(name.into())?;
-            let tree = BTreeLock::create(
-                ExampleSchema::<i16>::new(1),
-                b_tree::IndexOrder::new(Collator::default()),
-                dir,
-            )
-            .await?;
+            let tree =
+                BTreeLock::create(ExampleSchema::<i16>::new(1), Collator::default(), dir).await?;
             assert!(tree.read().await.is_empty(Range::<i16>::default()).await?);
         }
 
@@ -188,11 +184,7 @@ async fn root_creation_reclaims_cached_nodes() -> io::Result<()> {
             .load(path.clone())?;
         for name in ["first", "second", "third"] {
             let dir = root.read().await.get_dir(name).unwrap().clone();
-            let tree = BTreeLock::load(
-                ExampleSchema::<i16>::new(1),
-                b_tree::IndexOrder::new(Collator::default()),
-                dir,
-            )?;
+            let tree = BTreeLock::load(ExampleSchema::<i16>::new(1), Collator::default(), dir)?;
             tree.validate().await?;
             assert!(tree.read().await.is_empty(Range::<i16>::default()).await?);
         }
@@ -211,7 +203,7 @@ async fn missing_root_returns_errors_without_repair() -> io::Result<()> {
         let dir = cache.load(path.clone())?;
         let tree = BTreeLock::create(
             ExampleSchema::<i16>::new(1),
-            b_tree::IndexOrder::new(Collator::default()),
+            Collator::default(),
             dir.clone(),
         )
         .await?;
@@ -321,7 +313,7 @@ async fn interrupted_truncate_does_not_publish_a_missing_root() -> io::Result<()
             let dir = root.write().await.create_dir("tree".into())?;
             let tree = BTreeLock::create(
                 ExampleSchema::<i16>::new(1),
-                b_tree::IndexOrder::new(Collator::default()),
+                Collator::default(),
                 dir.clone(),
             )
             .await?;
@@ -349,7 +341,7 @@ async fn interrupted_truncate_does_not_publish_a_missing_root() -> io::Result<()
             assert!(
                 BTreeLock::load(
                     ExampleSchema::<i16>::new(1),
-                    b_tree::IndexOrder::new(Collator::<i16>::default()),
+                    Collator::<i16>::default(),
                     dir,
                 )
                 .is_err()
@@ -386,7 +378,7 @@ async fn sorted_ingestion_retains_last_input_across_equal_collator_splits() -> i
         let dir = cache.load(path.clone())?;
         let schema = ExampleSchema::<i16>::new(1);
         let order = schema.order() as i16;
-        let tree = BTreeLock::create(schema, b_tree::IndexOrder::new(Equal), dir.clone()).await?;
+        let tree = BTreeLock::create(schema, Equal, dir.clone()).await?;
         let keys = (0..=order).chain([order]).map(|i| Ok(vec![i]));
 
         assert_eq!(
@@ -491,11 +483,7 @@ async fn sorted_ingestion_retains_last_input_across_equal_collator_splits() -> i
         drop(tree);
         let dir = Cache::<File>::new(1024 * 1024, None, 0, std::time::Duration::from_secs(1))
             .load(path.clone())?;
-        let tree = BTreeLock::load(
-            ExampleSchema::<i16>::new(1),
-            b_tree::IndexOrder::new(Equal),
-            dir,
-        )?;
+        let tree = BTreeLock::load(ExampleSchema::<i16>::new(1), Equal, dir)?;
         tree.validate().await?;
         for key in (1..40).chain([100]) {
             assert!(tree.read().await.contains(&[key]).await?, "missing {key}");
@@ -519,7 +507,7 @@ async fn selected_columns_preserve_rows_order_and_guard_release() -> io::Result<
         let dir = cache.load(fixture.path().to_owned())?;
         let tree = BTreeLock::create(
             ExampleSchema::<i16>::new(3),
-            b_tree::IndexOrder::new(Collator::default()),
+            Collator::default(),
             dir.clone(),
         )
         .await?;
@@ -666,7 +654,7 @@ async fn borrowed_visits_preserve_order_and_release_guards() -> io::Result<()> {
         let dir = cache.load(fixture.path().to_owned())?;
         let tree = BTreeLock::create(
             ExampleSchema::<i16>::new(2),
-            b_tree::IndexOrder::new(Collator::default()),
+            Collator::default(),
             dir.clone(),
         )
         .await?;
@@ -855,12 +843,8 @@ async fn count_releases_parent_access_with_one_io_slot() -> io::Result<()> {
             std::time::Duration::from_secs(3),
         )
         .load(fixture.path().to_owned())?;
-        let tree = BTreeLock::create(
-            ExampleSchema::<i16>::new(1),
-            b_tree::IndexOrder::new(Collator::default()),
-            dir,
-        )
-        .await?;
+        let tree =
+            BTreeLock::create(ExampleSchema::<i16>::new(1), Collator::default(), dir).await?;
         for key in 0..40 {
             tree.write().await.insert(vec![key]).await?;
         }
@@ -874,11 +858,7 @@ async fn count_releases_parent_access_with_one_io_slot() -> io::Result<()> {
             std::time::Duration::from_secs(1),
         )
         .load(fixture.path().to_owned())?;
-        let tree = BTreeLock::load(
-            ExampleSchema::<i16>::new(1),
-            b_tree::IndexOrder::new(Collator::default()),
-            dir,
-        )?;
+        let tree = BTreeLock::load(ExampleSchema::<i16>::new(1), Collator::default(), dir)?;
         assert_eq!(tree.read().await.count(&Range::<i16>::default()).await?, 40);
     }
     fixture.close()
@@ -938,7 +918,7 @@ fn ordinary_traversals_reject_ancestor_cycles() -> io::Result<()> {
                 .load(fixture.path().to_owned())?;
                 let tree = BTreeLock::create(
                     ExampleSchema::<i16>::new(1),
-                    b_tree::IndexOrder::new(Collator::default()),
+                    Collator::default(),
                     dir.clone(),
                 )
                 .await?;
@@ -1061,7 +1041,7 @@ async fn borrowed_exact_lookup_checks_uniqueness_before_callback() -> io::Result
             .load(fixture.path().to_owned())?;
         let mut schema = ExampleSchema::<i16>::new(2);
         schema.order = 3;
-        let tree = BTreeLock::create(schema, b_tree::IndexOrder::new(Equal), dir.clone()).await?;
+        let tree = BTreeLock::create(schema, Equal, dir.clone()).await?;
         for row in [[0, 0], [1, 10], [1, 11], [2, 20], [3, 30]] {
             tree.write().await.insert(row.to_vec()).await?;
         }
@@ -1237,12 +1217,8 @@ async fn ordinary_reads_reject_malformed_index_separators() -> io::Result<()> {
         let width = 2;
         let dir = Cache::<File>::new(1024 * 1024, Some(1), 0, std::time::Duration::from_secs(3))
             .load(fixture.path().to_owned())?;
-        let tree = BTreeLock::create(
-            CheckedSchema(&width),
-            b_tree::IndexOrder::new(Collator::default()),
-            dir.clone(),
-        )
-        .await?;
+        let tree =
+            BTreeLock::create(CheckedSchema(&width), Collator::default(), dir.clone()).await?;
         let ids = [1, 2, 3].map(uuid::Uuid::from_u128);
         let root_id = uuid::Uuid::nil();
         let root;

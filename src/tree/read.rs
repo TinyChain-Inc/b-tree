@@ -18,8 +18,8 @@ use safecast::AsType;
 use smallvec::SmallVec;
 use uuid::Uuid;
 
-use super::{BTree, Key, Leaf, Node, ROOT, RangeCollator, Schema, validate_index, validate_rows};
 use crate::{NODE_STACK_SIZE, node::Block, range::Range};
+use super::{BTree, Key, Leaf, Node, ROOT, RangeCollator, Schema, validate_index, validate_rows};
 
 type ScopedKeys<'a, V> = Pin<Box<dyn Stream<Item = Result<Key<V>, io::Error>> + Send + 'a>>;
 
@@ -27,11 +27,10 @@ type Nodes<'a, FE, V> = Pin<Box<dyn Stream<Item = Result<Leaf<FE, V>, io::Error>
 
 type ResultNodes<'a, FE, V> = Result<Nodes<'a, FE, V>, io::Error>;
 
-impl<S, C, FE, G, O> BTree<S, C, G, O>
+impl<S, C, FE, G> BTree<S, C, G>
 where
     S: Schema,
     C: Collate<Value = S::Value>,
-    O: Collate<Value = S::Value>,
     FE: AsType<Node<S::Value>> + Send + Sync + FileLoad,
     G: DirDeref<Entry = FE>,
     Node<S::Value>: fmt::Debug,
@@ -67,7 +66,7 @@ where
     /// use freqfs::{DirDeref, FileLoad};
     /// use safecast::AsType;
     ///
-    /// async fn escape<S, C, FE, G>(tree: &BTree<S, C, G, O>, key: &[S::Value])
+    /// async fn escape<S, C, FE, G>(tree: &BTree<S, C, G>, key: &[S::Value])
     /// where
     ///     S: Schema,
     ///     C: Collate<Value = S::Value>,
@@ -127,9 +126,9 @@ where
             prefix,
             move |row, key| {
                 if complete {
-                    self.ordering.key_collator().cmp(row, key)
+                    self.collator.cmp_keys(row, key)
                 } else {
-                    self.ordering.range_collator().cmp_slices(row, key)
+                    self.collator.cmp_slices(row, key)
                 }
             },
             |path, row| {
@@ -160,7 +159,7 @@ where
         let path = self
             .visit_ordered(
                 key,
-                |row, key| self.ordering.key_collator().cmp(row, key),
+                |row, key| self.collator.cmp_keys(row, key),
                 |_, row| {
                     found =
                         row.len() >= key.len() && row.iter().zip(key).all(|(a, b)| a == b.borrow());
@@ -180,12 +179,8 @@ where
         key: &[V],
         visit: impl FnMut(&[(Uuid, usize)], &[S::Value]) -> Result<bool, io::Error>,
     ) -> Result<Vec<(Uuid, usize)>, io::Error> {
-        self.visit_ordered(
-            key,
-            |row, key| self.ordering.range_collator().cmp_slices(row, key),
-            visit,
-        )
-        .await
+        self.visit_ordered(key, |row, key| self.collator.cmp_slices(row, key), visit)
+            .await
     }
 
     // Ordinary groups support semantic prefixes and replacement. Complete-key
@@ -215,12 +210,7 @@ where
 
             match &*node {
                 Node::Index(separators, children) => {
-                    validate_index(
-                        &*self.schema,
-                        self.ordering.range_collator(),
-                        separators,
-                        children,
-                    )?;
+                    validate_index(&*self.schema, &self.collator, separators, children)?;
                     let slot = separators.partition_point(|separator| {
                         compare(separator, key)
                             .then_with(|| separator.len().cmp(&key.len()))
@@ -297,12 +287,7 @@ where
                 ));
             };
 
-            validate_index(
-                &*self.schema,
-                self.ordering.range_collator(),
-                rows,
-                children,
-            )?;
+            validate_index(&*self.schema, &self.collator, rows, children)?;
             if slot >= children.len() {
                 return Err(freqfs::IntegrityError::invalid_data("invalid child slot"));
             }
@@ -351,12 +336,7 @@ where
                         return Ok(Some(node));
                     }
                     Node::Index(rows, children) => {
-                        validate_index(
-                            &*self.schema,
-                            self.ordering.range_collator(),
-                            rows,
-                            children,
-                        )?;
+                        validate_index(&*self.schema, &self.collator, rows, children)?;
                         let slot = if forward { 0 } else { children.len() - 1 };
                         path.push((child, slot));
                         child = children[slot];
@@ -373,7 +353,7 @@ where
     where
         BV: Borrow<S::Value>,
     {
-        range.validate(self.schema.len(), self.ordering.range_collator())?;
+        range.validate(self.schema.len(), &self.collator)?;
         let root = self
             .dir
             .as_dir()
@@ -401,12 +381,12 @@ where
                         return Ok(keys.len() as u64);
                     }
 
-                    let (l, r) = keys.bisect(range, self.ordering.range_collator());
+                    let (l, r) = keys.bisect(range, &self.collator);
 
                     if l == keys.len() {
                         Ok(0)
                     } else if l == r {
-                        if range.contains_value(&keys[l], self.ordering.range_collator()) {
+                        if range.contains_value(&keys[l], &self.collator) {
                             Ok(1)
                         } else {
                             Ok(0)
@@ -416,14 +396,8 @@ where
                     }
                 }
                 Node::Index(separators, children) => {
-                    validate_index(
-                        &*self.schema,
-                        self.ordering.range_collator(),
-                        separators,
-                        children,
-                    )?;
-                    let (start, end) =
-                        range.child_slots(separators, self.ordering.range_collator());
+                    validate_index(&*self.schema, &self.collator, separators, children)?;
+                    let (start, end) = range.child_slots(separators, &self.collator);
                     if start >= end {
                         return Ok(0);
                     }
@@ -471,7 +445,7 @@ where
     where
         BV: Borrow<S::Value>,
     {
-        range.validate(self.schema.len(), self.ordering.range_collator())?;
+        range.validate(self.schema.len(), &self.collator)?;
         self.edge(&range, false, |row| stack_key(row)).await
     }
 
@@ -480,7 +454,7 @@ where
     where
         BV: Borrow<S::Value>,
     {
-        range.validate(self.schema.len(), self.ordering.range_collator())?;
+        range.validate(self.schema.len(), &self.collator)?;
         self.edge(&range, true, |row| stack_key(row)).await
     }
 
@@ -511,14 +485,8 @@ where
 
             match &*node {
                 Node::Index(separators, children) => {
-                    validate_index(
-                        &*self.schema,
-                        self.ordering.range_collator(),
-                        separators,
-                        children,
-                    )?;
-                    let (start, end) =
-                        range.child_slots(separators, self.ordering.range_collator());
+                    validate_index(&*self.schema, &self.collator, separators, children)?;
+                    let (start, end) = range.child_slots(separators, &self.collator);
                     if start >= end {
                         return Ok(None);
                     }
@@ -540,7 +508,7 @@ where
                 return Err(freqfs::IntegrityError::invalid_data("expected leaf"));
             };
 
-            let (start, end) = rows.bisect(range, self.ordering.range_collator());
+            let (start, end) = rows.bisect(range, &self.collator);
             if start < end {
                 let row = &rows[if reverse { end - 1 } else { start }];
                 return Ok(Some(read(row)));
@@ -549,8 +517,7 @@ where
 
             match self
                 .adjacent_leaf_until(&mut path, !reverse, |separator| {
-                    let order =
-                        range.cmp_endpoint(separator, reverse, self.ordering.range_collator());
+                    let order = range.cmp_endpoint(separator, reverse, &self.collator);
                     if reverse {
                         order.is_lt()
                     } else {
@@ -568,18 +535,17 @@ where
     /// Return `true` if the given `range` of this B+Tree contains zero keys.
     pub async fn is_empty<R: Borrow<Range<S::Value>>>(&self, range: R) -> Result<bool, io::Error> {
         let range = range.borrow().as_ref();
-        range.validate(self.schema.len(), self.ordering.range_collator())?;
+        range.validate(self.schema.len(), &self.collator)?;
         self.edge(&range, false, |_| ())
             .await
             .map(|row| row.is_none())
     }
 }
 
-impl<S, C, FE, G, O> BTree<S, C, G, O>
+impl<S, C, FE, G> BTree<S, C, G>
 where
     S: Schema + Send + Sync,
     C: Collate<Value = S::Value> + Clone + Send + Sync + 'static,
-    O: Collate<Value = S::Value> + Clone + Send + Sync + 'static,
     FE: AsType<Node<S::Value>> + Send + Sync + 'static + FileLoad,
     G: DirDeref<Entry = FE> + Clone + Send + Sync,
     Node<S::Value>: fmt::Debug,
@@ -600,10 +566,10 @@ where
         BV: Borrow<S::Value> + Clone + Send + Sync,
         E: From<io::Error>,
     {
-        range.validate(self.schema.len(), self.ordering.range_collator())?;
+        range.validate(self.schema.len(), &self.collator)?;
         let mut nodes = nodes(
             &self.dir,
-            self.ordering.range_collator().clone(),
+            self.collator.clone(),
             range,
             ROOT,
             reverse,
@@ -680,7 +646,7 @@ where
         G: 'a,
         S: 'a,
     {
-        range.validate(self.schema.len(), self.ordering.range_collator())?;
+        range.validate(self.schema.len(), &self.collator)?;
         if columns
             .as_ref()
             .is_some_and(|columns| columns.iter().any(|&column| column >= self.schema.len()))
@@ -693,7 +659,7 @@ where
 
         let nodes = nodes(
             self.dir,
-            self.ordering.range,
+            self.collator,
             range,
             ROOT,
             reverse,
@@ -756,7 +722,7 @@ impl fmt::Debug for NodeRead {
 
 fn nodes<'a, S, C, BV, FE, G, H>(
     dir: G,
-    ordering: RangeCollator<C>,
+    collator: RangeCollator<C>,
     range: Range<BV>,
     node_id: Uuid,
     reverse: bool,
@@ -804,12 +770,12 @@ where
                 if range.is_empty() {
                     NodeRead::Leaf((0, keys.len()))
                 } else {
-                    let (l, r) = keys.bisect(&range, &ordering);
+                    let (l, r) = keys.bisect(&range, &collator);
 
                     if r == 0 || l == keys.len() {
                         NodeRead::Excluded
                     } else if l == r {
-                        if range.contains_value(&keys[l], &ordering) {
+                        if range.contains_value(&keys[l], &collator) {
                             NodeRead::Leaf((l, l + 1))
                         } else {
                             NodeRead::Excluded
@@ -820,8 +786,8 @@ where
                 }
             }
             Node::Index(separators, children) => {
-                validate_index(&*schema, &ordering, separators, children)?;
-                let (start, end) = range.child_slots(separators, &ordering);
+                validate_index(&*schema, &collator, separators, children)?;
+                let (start, end) = range.child_slots(separators, &collator);
                 if start >= end {
                     NodeRead::Excluded
                 } else if end - start == 1 {
@@ -842,7 +808,7 @@ where
             }
             NodeRead::Child(node_id) => {
                 let nodes = stream::once(nodes(
-                    dir, ordering, range, node_id, reverse, ancestors, schema,
+                    dir, collator, range, node_id, reverse, ancestors, schema,
                 ))
                 .try_flatten();
 
@@ -855,7 +821,7 @@ where
                         let slot = if reverse { len - i - 1 } else { i };
                         nodes(
                             dir.clone(),
-                            ordering.clone(),
+                            collator.clone(),
                             range.clone(),
                             children[slot],
                             reverse,

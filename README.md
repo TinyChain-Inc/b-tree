@@ -42,26 +42,17 @@ separator construction, and routing. Collation equality can group distinct
 values, so exact-row matching checks semantic identity separately. `Range` owns
 inclusive/exclusive endpoint comparison.
 
-`IndexOrder::new(range_values)` configures range collation and complete-key
-ordering using one ordinary `Collate` implementation. The consuming builder
-`.with_storage_order(storage_values)` optionally refines complete-key ties: it
-compares every range column and key length before applying the storage comparator.
-Both value comparators must preserve semantic equality; storage comparison may
-leave residual ties. The default type parameter is `IndexOrder<C, C>`; construction
-moves the range comparator and stores no refinement without the builder.
-
-The immutable configuration does not implement `Collate`. Select
-`.range_collator()` for ranges, prefixes, routing, and range reservations, or
-`.key_collator()` for complete stored keys. The latter borrows the configuration;
-its `cmp` accepts borrowed slices and `cmp_iter` accepts replayable borrowed
-column iterators without allocating projected rows or cloning values. These
-views implement ordinary `Collate` and `CollateRef`. Storage refinement cannot
-reorder range groups or override a later range column.
+`BTreeLock::{create, load}` and the stream-decoding context receive one ordinary
+value comparator implementing `Collate`. The index retains it in a
+`RangeCollator<C>`, borrowed through `collator()`. Its `Collate` and `CollateRef`
+implementations compare ranges and shared prefixes. Its explicit `cmp_keys`
+method compares complete borrowed keys, including their lengths; `cmp_key_iter`
+compares borrowed exact-size column iterators in one pass without cloning
+iterators or values or allocating projected rows.
 
 Insertion, replacement, and strict validation share the complete-key order,
-including across leaves. `BTreeLock::{create, load}` and the stream-decoding
-context receive an `IndexOrder`; `ordering()` borrows the retained configuration.
-Callers which change the storage order must recreate noncanonical storage;
+including across leaves. Keep the value comparator unchanged when reopening an
+index. Callers which change the comparison order must recreate noncanonical storage;
 loading does not sort or migrate it.
 
 Schemas validate supplied separator columns through `validate_prefix`; adapters

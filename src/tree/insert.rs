@@ -20,11 +20,10 @@ enum Insert<V> {
     Split(Vec<V>, Uuid),
 }
 
-impl<S, C, FE, O> BTree<S, C, DirWriteGuardOwned<FE>, O>
+impl<S, C, FE> BTree<S, C, DirWriteGuardOwned<FE>>
 where
     S: Schema + Send + Sync,
     C: Collate<Value = S::Value> + Send + Sync,
-    O: Collate<Value = S::Value> + Send + Sync,
     FE: AsType<Node<S::Value>> + Send + Sync + FileLoad,
 {
     /// Return `false` if the given `key` is already present.
@@ -48,7 +47,7 @@ where
         Box::pin(async move {
             futures::pin_mut!(keys);
 
-            // A split can leave a different ordering-equal row at the right edge.
+            // A split can leave a different collator-equal row at the right edge.
             // Retain the last input to preserve exact duplicate detection.
             let (mut leaf_id, mut previous) = {
                 let (id, leaf) = self.rightmost_leaf().await?;
@@ -65,7 +64,7 @@ where
                 let key = validate_key(&*self.schema, key)?;
 
                 if let Some(previous) = &previous {
-                    match self.ordering.key_collator().cmp(&key, previous) {
+                    match self.collator.cmp_keys(&key, previous) {
                         Ordering::Less => {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidInput,
@@ -136,12 +135,7 @@ where
                     return Ok((id, node));
                 }
                 Node::Index(separators, children) => {
-                    super::validate_index(
-                        &*self.schema,
-                        self.ordering.range_collator(),
-                        separators,
-                        children,
-                    )?;
+                    super::validate_index(&*self.schema, &self.collator, separators, children)?;
                     id = *children
                         .last()
                         .ok_or_else(|| freqfs::IntegrityError::invalid_data("empty BTree index"))?;
@@ -186,8 +180,7 @@ where
                     let mid = if root { order.div_ceil(2) } else { order / 2 };
                     let right = rows.split_off(mid);
                     let separator = self
-                        .ordering
-                        .range_collator()
+                        .collator
                         .separator(rows.last().expect("split left"), &right[0]);
 
                     (separator, Node::Leaf(right))
