@@ -252,6 +252,17 @@ where
 {
     /// Validate the complete selected tree before accepting storage.
     pub async fn validate(&self) -> Result<(), io::Error> {
+        self.validate_with(|_| Ok(())).await
+    }
+
+    /// Validate the tree and check each borrowed leaf row in tree order.
+    ///
+    /// The check runs with native read guards held. It must finish synchronously
+    /// without acquiring other locks.
+    pub async fn validate_with(
+        &self,
+        mut check_row: impl FnMut(&[S::Value]) -> io::Result<()> + Send,
+    ) -> Result<(), io::Error> {
         let invalid = |message| freqfs::IntegrityError::invalid_data(message);
         let tree = self.read().await;
         for (name, entry) in tree.dir.as_dir().iter() {
@@ -289,13 +300,18 @@ where
                         rows.len() >= order / 2 && rows.len() < order
                     };
 
-                    if !valid_count
-                        || rows.iter().any(|row| {
-                            row.len() != self.schema.len()
-                                || self.schema.validate_key(row.clone()).is_err()
-                        })
-                    {
+                    if !valid_count {
                         return Err(invalid("invalid BTree leaf"));
+                    }
+
+                    for row in rows {
+                        if row.len() != self.schema.len() {
+                            return Err(invalid("invalid BTree leaf"));
+                        }
+
+                        self.schema
+                            .validate_key(row)
+                            .map_err(freqfs::IntegrityError::invalid_data)?;
                     }
 
                     if rows
@@ -344,9 +360,13 @@ where
                     {
                         return Err(invalid("unbalanced BTree"));
                     }
+
+                    for row in rows {
+                        check_row(row)?;
+                    }
                 }
                 Node::Index(separators, children) => {
-                    for (i, child) in children.iter().enumerate() {
+                    for (i, child) in children.iter().enumerate().rev() {
                         pending.push((
                             *child,
                             i.checked_sub(1)
@@ -568,8 +588,10 @@ fn required_node_error(error: io::Error) -> io::Error {
 #[inline]
 fn validate_key<S: Schema>(schema: &S, key: Vec<S::Value>) -> Result<Vec<S::Value>, io::Error> {
     schema
-        .validate_key(key)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
+        .validate_key(&key)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+
+    Ok(key)
 }
 
 fn validate_rows<V>(rows: &[Vec<V>], width: usize) -> io::Result<()> {

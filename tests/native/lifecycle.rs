@@ -1195,8 +1195,8 @@ async fn ordinary_reads_reject_malformed_index_separators() -> io::Result<()> {
             }
         }
 
-        fn validate_key(&self, key: Vec<i16>) -> io::Result<Vec<i16>> {
-            self.validate_prefix(&key)?;
+        fn validate_key(&self, key: &[i16]) -> io::Result<()> {
+            self.validate_prefix(key)?;
             if key.len() != self.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -1204,7 +1204,7 @@ async fn ordinary_reads_reject_malformed_index_separators() -> io::Result<()> {
                 ));
             }
 
-            Ok(key)
+            Ok(())
         }
     }
 

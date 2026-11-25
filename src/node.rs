@@ -4,6 +4,8 @@ use std::fmt;
 
 use collate::{Collate, Overlap, OverlapsValue};
 #[cfg(feature = "stream")]
+use destream::de::FromStream;
+#[cfg(feature = "stream")]
 use destream::{de, en};
 use get_size::GetSize;
 use uuid::Uuid;
@@ -157,45 +159,111 @@ impl<N: GetSize> GetSize for Node<N> {
 }
 
 #[cfg(feature = "stream")]
-struct NodeVisitor<C, N> {
-    context: C,
-    phantom: std::marker::PhantomData<N>,
-}
+impl<R> Node<Vec<R>> {
+    /// Encode this node with a caller-provided row codec, checking index fanout.
+    pub fn encode_bounded<'en, E, Rows>(
+        &'en self,
+        encoder: E,
+        max_children: usize,
+        rows: impl FnOnce(&'en [R]) -> Rows,
+    ) -> Result<E::Ok, E::Error>
+    where
+        E: en::Encoder<'en>,
+        Rows: en::IntoStream<'en> + 'en,
+    {
+        match self {
+            Self::Leaf(keys) => encode_node(encoder, rows(keys), None::<&[Uuid]>),
+            Self::Index(keys, children) => {
+                if children.len() > max_children || !valid_fanout(keys.len(), children.len()) {
+                    return Err(en::Error::custom("invalid B+Tree fanout"));
+                }
 
-#[cfg(feature = "stream")]
-impl<C, N> NodeVisitor<C, N> {
-    fn new(context: C) -> Self {
-        Self {
-            context,
-            phantom: std::marker::PhantomData,
+                encode_node(encoder, rows(keys), Some(children.as_slice()))
+            }
+        }
+    }
+
+    /// Decode a node using a bounded row codec and an independent child limit.
+    /// Index nodes must have at least one separator and one more child than row.
+    pub async fn decode_bounded<M, D>(
+        context: M::Context,
+        decoder: &mut D,
+        max_children: usize,
+    ) -> Result<Self, D::Error>
+    where
+        M: de::FromStream + Into<Vec<R>>,
+        D: de::Decoder,
+    {
+        match decode_node::<M, _>(context, decoder, max_children).await? {
+            Node::Leaf(rows) => Ok(Self::Leaf(rows.into())),
+            Node::Index(rows, children) => {
+                let rows = rows.into();
+                if !valid_fanout(rows.len(), children.len()) {
+                    return Err(de::Error::custom("invalid B+Tree fanout"));
+                }
+
+                Ok(Self::Index(rows, children))
+            }
         }
     }
 }
 
 #[cfg(feature = "stream")]
-impl<N> de::Visitor for NodeVisitor<N::Context, N>
+fn valid_fanout(rows: usize, children: usize) -> bool {
+    rows > 0 && children.checked_sub(1) == Some(rows)
+}
+
+#[cfg(feature = "stream")]
+async fn decode_node<N, D>(
+    context: N::Context,
+    decoder: &mut D,
+    max_children: usize,
+) -> Result<Node<N>, D::Error>
 where
     N: de::FromStream,
+    D: de::Decoder,
 {
-    type Value = Node<N>;
-
-    fn expecting() -> &'static str {
-        "a B+Tree node"
+    let mut fields = decoder.open_container(de::Kind::Seq, None).await?;
+    if fields.slot() == de::Slot::End {
+        return Err(de::Error::custom("missing B+Tree leaf flag"));
     }
 
-    async fn visit_seq<A: de::SeqAccess>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-        let leaf = seq.expect_next::<bool>(()).await?;
+    let leaf = bool::from_stream((), decoder).await?;
+    decoder.finish_child(&mut fields).await?;
+    if fields.slot() == de::Slot::End {
+        return Err(de::Error::custom("missing B+Tree rows"));
+    }
 
-        if leaf {
-            match seq.expect_next(self.context).await {
-                Ok(leaf) => Ok(Node::Leaf(leaf)),
-                Err(cause) => Err(cause),
-            }
-        } else {
-            let separators = seq.expect_next(self.context).await?;
-            let children = seq.expect_next(()).await?;
-            Ok(Node::Index(separators, children))
+    let rows = N::from_stream(context, decoder).await?;
+    decoder.finish_child(&mut fields).await?;
+    let node = if leaf {
+        Node::Leaf(rows)
+    } else {
+        if fields.slot() == de::Slot::End {
+            return Err(de::Error::custom("missing B+Tree children"));
         }
+
+        let mut seq = decoder.open_container(de::Kind::Seq, None).await?;
+        let mut children = Vec::new();
+        while seq.slot() != de::Slot::End {
+            if children.len() == max_children {
+                return Err(de::Error::custom("too many B+Tree children"));
+            }
+
+            let child = Uuid::from_stream((), decoder).await?;
+            decoder.finish_child(&mut seq).await?;
+            children.try_reserve(1).map_err(de::Error::custom)?;
+            children.push(child);
+        }
+
+        decoder.finish_child(&mut fields).await?;
+        Node::Index(rows, children.into_boxed_slice().into_vec())
+    };
+
+    if fields.slot() == de::Slot::End {
+        Ok(node)
+    } else {
+        Err(de::Error::custom("unexpected B+Tree node field"))
     }
 }
 
@@ -210,7 +278,22 @@ where
         cxt: Self::Context,
         decoder: &mut D,
     ) -> Result<Self, D::Error> {
-        decoder.decode_seq(NodeVisitor::new(cxt)).await
+        decode_node(cxt, decoder, usize::MAX).await
+    }
+}
+
+#[cfg(feature = "stream")]
+fn encode_node<'en, E, R, C>(encoder: E, rows: R, children: Option<C>) -> Result<E::Ok, E::Error>
+where
+    E: en::Encoder<'en>,
+    R: en::IntoStream<'en> + 'en,
+    C: en::IntoStream<'en> + 'en,
+{
+    use en::IntoStream;
+
+    match children {
+        Some(children) => (false, rows, children).into_stream(encoder),
+        None => (true, rows).into_stream(encoder),
     }
 }
 
@@ -221,8 +304,8 @@ where
 {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
         match self {
-            Node::Leaf(keys) => (true, keys).into_stream(encoder),
-            Node::Index(separators, children) => (false, separators, children).into_stream(encoder),
+            Node::Leaf(keys) => encode_node(encoder, keys, None::<Vec<Uuid>>),
+            Node::Index(keys, children) => encode_node(encoder, keys, Some(children)),
         }
     }
 }
@@ -233,11 +316,9 @@ where
     N: en::ToStream<'en>,
 {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        use en::IntoStream;
-
         match self {
-            Node::Leaf(keys) => (true, keys).into_stream(encoder),
-            Node::Index(separators, children) => (false, separators, children).into_stream(encoder),
+            Node::Leaf(keys) => encode_node(encoder, keys, None::<&[Uuid]>),
+            Node::Index(keys, children) => encode_node(encoder, keys, Some(children.as_slice())),
         }
     }
 }

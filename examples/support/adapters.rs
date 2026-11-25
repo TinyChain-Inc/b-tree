@@ -117,9 +117,9 @@ impl<T: fmt::Debug> Schema for ExampleSchema<T> {
         }
     }
 
-    fn validate_key(&self, key: Vec<i16>) -> Result<Vec<i16>, io::Error> {
+    fn validate_key(&self, key: &[i16]) -> Result<(), io::Error> {
         if key.len() == self.size {
-            Ok(key)
+            Ok(())
         } else {
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
