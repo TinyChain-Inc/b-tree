@@ -1,11 +1,10 @@
 use std::marker::PhantomData;
 use std::{fmt, io};
 
+use b_tree::{Node, Schema};
 use destream::{de, en};
 use futures::TryFutureExt;
 use safecast::AsType;
-
-use b_tree::{Node, Schema};
 
 #[cfg(test)]
 use crate::observations::{INDEX_WRITES, LEAF_READS};

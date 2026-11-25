@@ -22,12 +22,7 @@ async fn sorted_ingestion_matches_insertion_and_survives_errors() -> Result<(), 
     {
         let cache = Cache::<File>::new(1024 * 1024, None, 0, std::time::Duration::from_secs(3));
         let dir = cache.load(path.clone())?;
-        let tree = BTreeLock::create(
-            ExampleSchema::<i16>::new(1),
-            b_tree::IndexOrder::new(Counted),
-            dir,
-        )
-        .await?;
+        let tree = BTreeLock::create(ExampleSchema::<i16>::new(1), Counted, dir).await?;
         {
             let mut write = tree.write().await;
             assert_eq!(write.insert_sorted(stream::empty()).await?, 0);
@@ -84,11 +79,7 @@ async fn sorted_ingestion_matches_insertion_and_survives_errors() -> Result<(), 
         drop(tree);
         let reopened = Cache::<File>::new(1024 * 1024, None, 0, std::time::Duration::from_secs(3))
             .load(path.clone())?;
-        let tree = BTreeLock::load(
-            ExampleSchema::<i16>::new(1),
-            b_tree::IndexOrder::new(Counted),
-            reopened,
-        )?;
+        let tree = BTreeLock::load(ExampleSchema::<i16>::new(1), Counted, reopened)?;
         let actual: Vec<_> = tree
             .read()
             .await
@@ -221,11 +212,7 @@ async fn duplicate_insertion_preserves_retained_allocation() -> io::Result<()> {
             if count == 8 {
                 schema.order = 4;
             }
-            let tree = BTreeLock::load(
-                schema,
-                b_tree::IndexOrder::new(Collator::default()),
-                dir.clone(),
-            )?;
+            let tree = BTreeLock::load(schema, Collator::default(), dir.clone())?;
             tree.validate().await?;
             {
                 let mut write = tree.write().await;
@@ -264,11 +251,7 @@ async fn duplicate_insertion_preserves_retained_allocation() -> io::Result<()> {
             if count == 8 {
                 schema.order = 4;
             }
-            let tree = BTreeLock::load(
-                schema,
-                b_tree::IndexOrder::new(Collator::default()),
-                reopened,
-            )?;
+            let tree = BTreeLock::load(schema, Collator::default(), reopened)?;
             tree.validate().await?;
             let keys: Vec<_> = tree
                 .read()

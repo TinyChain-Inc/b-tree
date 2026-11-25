@@ -9,11 +9,10 @@ use uuid::Uuid;
 
 use super::{BTree, Node, Schema, validate_index, validate_key};
 
-impl<S, C, FE, O> BTree<S, C, DirWriteGuardOwned<FE>, O>
+impl<S, C, FE> BTree<S, C, DirWriteGuardOwned<FE>>
 where
     S: Schema + Send + Sync,
     C: Collate<Value = S::Value> + Send + Sync,
-    O: Collate<Value = S::Value> + Send + Sync,
     FE: AsType<Node<S::Value>> + Send + Sync + FileLoad,
 {
     /// Replace an exact row, relocating it when its ordered position changes.
@@ -21,7 +20,7 @@ where
     /// Replacement stays in place when it remains between its neighbors.
     /// Returns false when the previous row is absent.
     ///
-    /// Distinct ordering-equivalent rows are allowed. Value collisions are
+    /// Distinct collator-equivalent rows are allowed. Value collisions are
     /// rejected before any row contents change.
     ///
     /// The supplied row is published even when semantically equal to the old row.
@@ -111,7 +110,7 @@ where
             slot.checked_sub(1),
             slot.checked_add(1).filter(|&i| i < rows.len()),
         ]
-        .map(|next| next.map(|i| self.ordering.key_collator().cmp(&replacement, &rows[i])));
+        .map(|next| next.map(|i| self.collator.cmp_keys(&replacement, &rows[i])));
         drop(node);
 
         // Only a changed leaf extreme can cross a routing separator. At most two
@@ -132,7 +131,7 @@ where
 
                 let neighbor_slot = neighbor_path.last().expect("neighbor path").1;
                 let neighbor_row = &rows[neighbor_slot];
-                let order = self.ordering.key_collator().cmp(&replacement, neighbor_row);
+                let order = self.collator.cmp_keys(&replacement, neighbor_row);
 
                 if if forward {
                     order.is_gt()
@@ -165,23 +164,12 @@ where
                     ));
                 };
 
-                validate_index(
-                    &*self.schema,
-                    self.ordering.range_collator(),
-                    separators,
-                    children,
-                )?;
+                validate_index(&*self.schema, &self.collator, separators, children)?;
                 let separator = separators.get(boundary).ok_or_else(|| {
                     freqfs::IntegrityError::invalid_data("missing replacement separator")
                 })?;
-                let previous_order = self
-                    .ordering
-                    .range_collator()
-                    .cmp_routing(previous, separator);
-                let neighbor_order = self
-                    .ordering
-                    .range_collator()
-                    .cmp_routing(neighbor_row, separator);
+                let previous_order = self.collator.cmp_keys(previous, separator);
+                let neighbor_order = self.collator.cmp_keys(neighbor_row, separator);
 
                 if if forward {
                     previous_order.is_gt() || neighbor_order.is_lt()
@@ -193,10 +181,7 @@ where
                     ));
                 }
 
-                let crosses = self
-                    .ordering
-                    .range_collator()
-                    .cmp_routing(&replacement, separator);
+                let crosses = self.collator.cmp_keys(&replacement, separator);
 
                 if if forward {
                     crosses.is_gt()
@@ -204,13 +189,9 @@ where
                     crosses.is_lt()
                 } {
                     let updated = if forward {
-                        self.ordering
-                            .range_collator()
-                            .separator(&replacement, neighbor_row)
+                        self.collator.separator(&replacement, neighbor_row)
                     } else {
-                        self.ordering
-                            .range_collator()
-                            .separator(neighbor_row, &replacement)
+                        self.collator.separator(neighbor_row, &replacement)
                     };
                     boundaries.push((level, boundary, separator.clone(), updated));
                 }

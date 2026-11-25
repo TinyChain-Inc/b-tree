@@ -25,84 +25,10 @@ pub const KEY_STACK_SIZE: usize = 32;
 /// The type of item in a stream of B+Tree keys
 pub type Key<V> = smallvec::SmallVec<[V; KEY_STACK_SIZE]>;
 
-/// Immutable range collation and storage ordering for an index.
-///
-/// Storage ordering preserves every range comparison: the optional storage
-/// comparator is applied only after all range columns and key lengths tie.
-/// Both value comparators must be consistent and preserve semantic equality.
-/// Keep the configuration unchanged when reopening an existing index.
-///
-/// ```
-/// use std::cmp::Ordering;
-/// use b_tree::IndexOrder;
-/// use collate::{Collate, Collator};
-///
-/// #[derive(Eq, PartialEq)]
-/// struct Magnitude;
-/// impl Collate for Magnitude {
-///     type Value = i32;
-///     fn cmp(&self, left: &i32, right: &i32) -> Ordering {
-///         left.unsigned_abs().cmp(&right.unsigned_abs())
-///     }
-/// }
-/// let ordering = IndexOrder::new(Magnitude)
-///     .with_storage_order(Collator::<i32>::default());
-/// assert!(ordering.range_collator().cmp(&vec![-3], &vec![3]).is_eq());
-/// assert!(ordering.key_collator().cmp(&[-3], &[3]).is_lt());
-/// ```
-///
-/// Select a comparison role explicitly; the configuration is not a comparator:
-///
-/// ```compile_fail
-/// use b_tree::IndexOrder;
-/// use collate::{Collate, Collator};
-/// let ordering = IndexOrder::new(Collator::<u32>::default());
-/// Collate::cmp(&ordering, &vec![1u32], &vec![2u32]);
-/// ```
-#[derive(Copy, Clone, Eq, PartialEq)]
-pub struct IndexOrder<C, O = C> {
-    range: RangeCollator<C>,
-    storage: Option<O>,
-}
-
-impl<C: Collate> IndexOrder<C> {
-    /// Use range collation alone to order complete keys, including key lengths.
-    /// Construction moves the comparator without cloning it.
-    pub fn new(range_values: C) -> Self {
-        Self {
-            range: RangeCollator::new(range_values),
-            storage: None,
-        }
-    }
-}
-
-impl<C, O> IndexOrder<C, O> {
-    /// Add storage ordering within groups of complete range-equivalent keys.
-    /// It cannot reorder different range groups or override later range columns.
-    pub fn with_storage_order<S>(self, storage_values: S) -> IndexOrder<C, S>
-    where
-        C: Collate,
-        S: Collate<Value = C::Value>,
-    {
-        IndexOrder {
-            range: self.range,
-            storage: Some(storage_values),
-        }
-    }
-
-    /// Borrow the comparator for ranges, prefixes, and range reservations.
-    pub fn range_collator(&self) -> &RangeCollator<C> {
-        &self.range
-    }
-
-    /// Borrow the comparator for complete stored keys.
-    pub fn key_collator(&self) -> KeyCollator<'_, C, O> {
-        KeyCollator { ordering: self }
-    }
-}
-
 /// Comparison of ranges and shared key prefixes using value collation.
 /// A matching prefix compares equal regardless of an omitted suffix.
+/// Use [`Self::cmp_keys`] or [`Self::cmp_key_iter`] for complete keys instead.
+/// Keep the value comparator unchanged when reopening an index.
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub struct RangeCollator<C> {
     value: C,
@@ -121,14 +47,27 @@ impl<C> RangeCollator<C> {
 }
 
 impl<C: Collate> RangeCollator<C> {
-    // An omitted suffix sorts before a full row only during routing.
-    fn cmp_routing<L, R>(&self, left: &[L], right: &[R]) -> Ordering
+    /// Compare complete borrowed keys lexicographically, including their lengths.
+    pub fn cmp_keys<L, R>(&self, left: &[L], right: &[R]) -> Ordering
     where
         L: Borrow<C::Value>,
         R: Borrow<C::Value>,
     {
-        self.cmp_slices(left, right)
-            .then_with(|| left.len().cmp(&right.len()))
+        self.cmp_key_iter(
+            left.iter().map(Borrow::borrow),
+            right.iter().map(Borrow::borrow),
+        )
+    }
+
+    /// Compare complete keys in one pass without allocating or cloning values or iterators.
+    pub fn cmp_key_iter<'a, 'b, L, R>(&self, left: L, right: R) -> Ordering
+    where
+        C::Value: 'a + 'b,
+        L: ExactSizeIterator<Item = &'a C::Value>,
+        R: ExactSizeIterator<Item = &'b C::Value>,
+    {
+        let lengths = left.len().cmp(&right.len());
+        cmp_values(&self.value, left, right).then(lengths)
     }
 
     // Retain the full right row when all range columns collate equally.
@@ -175,79 +114,6 @@ impl<C: Collate> CollateRef<[C::Value]> for RangeCollator<C> {
 impl<C: Collate> CollateRef<Key<C::Value>> for RangeCollator<C> {
     fn cmp_ref(&self, left: &Key<C::Value>, right: &Key<C::Value>) -> Ordering {
         self.cmp_slices(left, right)
-    }
-}
-
-/// A borrowed comparator for complete keys in an index's storage order.
-/// Comparisons retain no key values and require no intrinsic `Ord` or value clones.
-#[derive(Eq, PartialEq)]
-pub struct KeyCollator<'a, C, O = C> {
-    ordering: &'a IndexOrder<C, O>,
-}
-
-impl<C, O> KeyCollator<'_, C, O>
-where
-    C: Collate,
-    O: Collate<Value = C::Value>,
-{
-    /// Compare complete borrowed keys, including their lengths.
-    pub fn cmp<L, R>(&self, left: &[L], right: &[R]) -> Ordering
-    where
-        L: Borrow<C::Value>,
-        R: Borrow<C::Value>,
-    {
-        self.cmp_iter(
-            left.iter().map(Borrow::borrow),
-            right.iter().map(Borrow::borrow),
-        )
-    }
-
-    /// Compare complete keys exposed as replayable borrowed column iterators.
-    /// Only the iterators are cloned; no projected rows are allocated.
-    pub fn cmp_iter<'a, 'b, L, R>(&self, left: L, right: R) -> Ordering
-    where
-        C::Value: 'a + 'b,
-        L: ExactSizeIterator<Item = &'a C::Value> + Clone,
-        R: ExactSizeIterator<Item = &'b C::Value> + Clone,
-    {
-        cmp_values(&self.ordering.range.value, left.clone(), right.clone())
-            .then_with(|| left.len().cmp(&right.len()))
-            .then_with(|| match &self.ordering.storage {
-                Some(storage) => cmp_values(storage, left, right),
-                None => Ordering::Equal,
-            })
-    }
-}
-
-impl<C, O> Collate for KeyCollator<'_, C, O>
-where
-    C: Collate,
-    O: Collate<Value = C::Value>,
-{
-    type Value = Vec<C::Value>;
-
-    fn cmp(&self, left: &Self::Value, right: &Self::Value) -> Ordering {
-        self.cmp(left.as_slice(), right.as_slice())
-    }
-}
-
-impl<C, O> CollateRef<[C::Value]> for KeyCollator<'_, C, O>
-where
-    C: Collate,
-    O: Collate<Value = C::Value>,
-{
-    fn cmp_ref(&self, left: &[C::Value], right: &[C::Value]) -> Ordering {
-        self.cmp(left, right)
-    }
-}
-
-impl<C, O> CollateRef<Key<C::Value>> for KeyCollator<'_, C, O>
-where
-    C: Collate,
-    O: Collate<Value = C::Value>,
-{
-    fn cmp_ref(&self, left: &Key<C::Value>, right: &Key<C::Value>) -> Ordering {
-        self.cmp(left.as_slice(), right.as_slice())
     }
 }
 
