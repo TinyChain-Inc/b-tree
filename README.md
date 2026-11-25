@@ -118,7 +118,8 @@ comparison for keys and descendant ranges; equal-length prefixes compare bounds.
 Equivalent-group navigation reuses acquired leaf guards and retains only a
 root-to-leaf path. Complete-key lookups use physical tie ordering to narrow the
 search, then check semantic equality within residual ties. Prefix lookups and
-replacement retain ordinary equivalent-group traversal. Strict validation checks
+replacement retain ordinary equivalent-group traversal. Strict validation
+checks borrowed leaf keys with the same schema used for mutation. It checks
 physical ordering and delegates duplicate detection only for residual physical
 ties; a collator without sufficient refinement can still require quadratic
 equality work within those groups. Replacement combines identity and collision checks when both

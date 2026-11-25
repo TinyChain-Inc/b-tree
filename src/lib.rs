@@ -157,6 +157,6 @@ pub trait Schema: Eq + fmt::Debug {
     /// A prefix must contain no more than [`Schema::len`] columns.
     fn validate_prefix(&self, prefix: &[Self::Value]) -> Result<(), Self::Error>;
 
-    /// Return a validated version of the given `key`, or a validation error.
-    fn validate_key(&self, key: Vec<Self::Value>) -> Result<Vec<Self::Value>, Self::Error>;
+    /// Validate a complete key without consuming or changing its values.
+    fn validate_key(&self, key: &[Self::Value]) -> Result<(), Self::Error>;
 }
